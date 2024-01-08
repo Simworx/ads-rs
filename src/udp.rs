@@ -185,6 +185,37 @@ impl Message {
         // Parse the reply.
         Self::parse_internal(&reply[..n], LE::read_u32(&self.data[8..]) | 0x8000_0000)
     }
+
+    #[cfg(feature = "tokio")]
+    /// Send message with tokio::net
+    pub async fn async_send_receive(&self, to: impl tokio::net::ToSocketAddrs) -> Result<Self> {
+        // Send self as a request.
+        let sock = tokio::net::UdpSocket::bind("0.0.0.0:0")
+            .await
+            .ctx("binding UDP socket")?;
+        sock.send_to(self.as_bytes(), to)
+            .await
+            .ctx("sending UDP request")?;
+
+        // Receive the reply.
+        let mut reply = [0; 576];
+
+        let timeout =
+            tokio::time::timeout(std::time::Duration::from_secs(3), sock.recv(&mut reply));
+
+        let n = match timeout.await {
+            Ok(result) => {
+                result.ctx("receiving UDP reply")?
+            },
+            
+            Err(_) => {
+                return Err(crate::Error::Reply("Timed out waiting for UDP reply", "Timeout reached", 0))
+            },
+        };
+
+        // Parse the reply.
+        Self::parse_internal(&reply[..n], LE::read_u32(&self.data[8..]) | 0x8000_0000)
+    }
 }
 
 /// Send a UDP message for setting a route.
@@ -212,6 +243,36 @@ pub fn add_route(target: (&str, u16), netid: AmsNetId, host: &str,
     }
 
     let reply = packet.send_receive(target)?;
+
+    match reply.get_u32(Tag::Status) {
+        None => Err(Error::Reply("setting route", "no status in reply", 0)),
+        Some(0) => Ok(()),
+        Some(n) => crate::errors::ads_error("setting route", n),
+    }
+}
+
+#[cfg(feature = "tokio")]
+/// Add a route, async style
+pub async fn async_add_route(
+    target: (&str, u16),
+    netid: AmsNetId,
+    host: &str,
+    routename: Option<&str>,
+    username: Option<&str>,
+    password: Option<&str>,
+    temporary: bool,
+) -> Result<()> {
+    let mut packet = Message::new(ServiceId::AddRoute, AmsAddr::new(netid, 0));
+    packet.add_bytes(Tag::NetID, &netid.0);
+    packet.add_str(Tag::ComputerName, host);
+    packet.add_str(Tag::UserName, username.unwrap_or("Administrator"));
+    packet.add_str(Tag::Password, password.unwrap_or("1"));
+    packet.add_str(Tag::RouteName, routename.unwrap_or(host));
+    if temporary {
+        packet.add_u32(Tag::Options, 1);
+    }
+
+    let reply = packet.async_send_receive(target).await?;
 
     match reply.get_u32(Tag::Status) {
         None => Err(Error::Reply("setting route", "no status in reply", 0)),
