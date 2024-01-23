@@ -3,13 +3,20 @@
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::convert::{TryFrom, TryInto};
-use std::io::{self, Read, Write};
 use std::mem::size_of;
-use std::net::{IpAddr, Shutdown, TcpStream, ToSocketAddrs};
 use std::str::FromStr;
 use std::time::Duration;
+use std::net::{IpAddr, ToSocketAddrs};
 
-use byteorder::{ByteOrder, ReadBytesExt, LE};
+#[cfg(not(feature="tokio"))]
+use std::{io::{Read, Write}, net::{TcpStream, TcpSocket}};
+
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+#[cfg(feature="tokio")]
+use tokio::{io::{AsyncWriteExt, AsyncReadExt}, net::{TcpStream}};
+
+
+use byteorder::{ByteOrder, LE};
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use itertools::Itertools;
 
@@ -112,7 +119,7 @@ pub enum Source {
 /// `Device` or `symbol::Handle` use a `&Client` as well.
 pub struct Client {
     /// TCP connection (duplicated with the reader)
-    socket: TcpStream,
+    socket_writer: OwnedWriteHalf,
     /// Current invoke ID (identifies the request/reply pair), incremented
     /// after each request
     invoke_id: Cell<u32>,
@@ -144,13 +151,13 @@ impl Drop for Client {
         if self.source_port_opened {
             let mut close_port_msg = [1, 0, 2, 0, 0, 0, 0, 0];
             LE::write_u16(&mut close_port_msg[6..], self.source.port());
-            let _ = self.socket.write_all(&close_port_msg);
+            let _ = self.socket_writer.write_all(&close_port_msg);
         }
 
         // Need to shutdown the connection since the socket is duplicated in the
         // reader thread.  This will cause the read() in the thread to return
         // with no data.
-        let _ = self.socket.shutdown(Shutdown::Both);
+        let _ = self.socket_writer.shutdown();
     }
 }
 
