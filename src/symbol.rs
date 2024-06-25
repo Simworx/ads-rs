@@ -90,7 +90,7 @@ pub fn get_size(device: &Device<'_>, symbol: &str) -> Result<usize> {
 }
 
 /// Get symbol location (index group and index offset) by name.
-pub fn get_location(device: Device<'_>, symbol: &str) -> Result<(u32, u32)> {
+pub fn get_location(device: &Device<'_>, symbol: &str) -> Result<(u32, u32)> {
     let mut buf = [0; 12];
     device.write_read_exact(index::GET_SYMINFO_BYNAME, 0, symbol.as_bytes(), &mut buf)?;
     Ok((
