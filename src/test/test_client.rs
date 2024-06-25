@@ -20,31 +20,53 @@ fn run_test(opts: ServerOpts, f: impl Fn(Device)) {
 
 #[test]
 fn test_garbage_packet() {
-    run_test(ServerOpts { garbage_header: true, .. Default::default() }, |device| {
-        let err = device.get_info().unwrap_err();
-        assert!(matches!(err, Error::Reply(_, "invalid packet or unknown AMS command", _)));
-    })
+    run_test(
+        ServerOpts {
+            garbage_header: true,
+            ..Default::default()
+        },
+        |device| {
+            let err = device.get_info().unwrap_err();
+            assert!(matches!(
+                err,
+                Error::Reply(_, "invalid packet or unknown AMS command", _)
+            ));
+        },
+    )
 }
 
 #[test]
 fn test_timeout() {
-    run_test(ServerOpts { timeout: Some(Duration::from_millis(1)),
-                          no_reply: true,
-                          .. Default::default() }, |device| {
-        let err = device.get_info().unwrap_err();
-        match err {
-            Error::Io(_, ioe) if ioe.kind() == io::ErrorKind::TimedOut => (),
-            _ => panic!("unexpected error from timeout: {}", err)
-        }
-    })
+    run_test(
+        ServerOpts {
+            timeout: Some(Duration::from_millis(1)),
+            no_reply: true,
+            ..Default::default()
+        },
+        |device| {
+            let err = device.get_info().unwrap_err();
+            match err {
+                Error::Io(_, ioe) if ioe.kind() == io::ErrorKind::TimedOut => (),
+                _ => panic!("unexpected error from timeout: {}", err),
+            }
+        },
+    )
 }
 
 #[test]
 fn test_wrong_invokeid() {
-    run_test(ServerOpts { ignore_invokeid: true, .. Default::default() }, |device| {
-        assert!(matches!(device.get_info().unwrap_err(),
-                         Error::Reply(_, "unexpected invoke ID", 0)));
-    })
+    run_test(
+        ServerOpts {
+            ignore_invokeid: true,
+            ..Default::default()
+        },
+        |device| {
+            assert!(matches!(
+                device.get_info().unwrap_err(),
+                Error::Reply(_, "unexpected invoke ID", 0)
+            ));
+        },
+    )
 }
 
 #[test]
@@ -74,10 +96,14 @@ fn test_readwrite() {
         device.read_exact(0x04020, 7, &mut buf).unwrap();
         assert_eq!(data, buf);
 
-        assert!(matches!(device.read_exact(0x4021, 0, &mut buf),
-                         Err(Error::Ads(_, _, 0x702))));
-        assert!(matches!(device.read_exact(0x4020, 98765, &mut buf),
-                         Err(Error::Ads(_, _, 0x703))));
+        assert!(matches!(
+            device.read_exact(0x4021, 0, &mut buf),
+            Err(Error::Ads(_, _, 0x702))
+        ));
+        assert!(matches!(
+            device.read_exact(0x4020, 98765, &mut buf),
+            Err(Error::Ads(_, _, 0x703))
+        ));
 
         device.write_value(0x4020, 7, &0xdeadbeef_u32).unwrap();
         assert!(device.read_value::<u32>(0x4020, 7).unwrap() == 0xdeadbeef);
@@ -86,8 +112,8 @@ fn test_readwrite() {
 
 #[test]
 fn test_multi_requests() {
-    use crate::index::*;
     use crate::client::*;
+    use crate::index::*;
     run_test(ServerOpts::default(), |device| {
         let mut buf1 = *b"ABCDEFGHIJ";
         let mut buf2 = *b"0123456789";
@@ -129,23 +155,23 @@ fn test_multi_requests() {
 fn test_fileaccess() {
     use crate::file::*;
     run_test(ServerOpts::default(), |device| {
-        assert!(File::open(device, "blub", 0).is_err());
-        let mut file = File::open(device, "/etc/passwd", WRITE).unwrap();
-        assert!(File::open(device, "/etc/passwd", 0).is_err());
+        assert!(File::open(&device, "blub", 0).is_err());
+        let mut file = File::open(&device, "/etc/passwd", WRITE).unwrap();
+        assert!(File::open(&device, "/etc/passwd", 0).is_err());
         assert!(file.read(&mut [0; 4]).is_err());
         file.write_all(b"asdf").unwrap();
         file.flush().unwrap();
         drop(file);
 
-        let mut file = File::open(device, "/etc/passwd", READ).unwrap();
+        let mut file = File::open(&device, "/etc/passwd", READ).unwrap();
         assert!(file.write(&[0; 4]).is_err());
         let mut vec = vec![];
         file.read_to_end(&mut vec).unwrap();
         assert!(vec.len() == 888);
-        assert!(File::delete(device, "/etc/passwd", 0).is_err());
+        assert!(File::delete(&device, "/etc/passwd", 0).is_err());
         drop(file);
 
-        File::delete(device, "/etc/passwd", 0).unwrap();
+        File::delete(&device, "/etc/passwd", 0).unwrap();
     })
 }
 
@@ -153,8 +179,8 @@ fn test_fileaccess() {
 fn test_symbolaccess() {
     use crate::symbol::*;
     run_test(ServerOpts::default(), |device| {
-        assert!(Handle::new(device, "blub").is_err());
-        let handle = Handle::new(device, "SYMBOL").unwrap();
+        assert!(Handle::new(&device, "blub").is_err());
+        let handle = Handle::new(&device, "SYMBOL").unwrap();
         assert!(handle.write(&[1, 2, 3, 4, 5]).is_err());
         assert!(handle.read(&mut [0; 5]).is_err());
 
@@ -177,8 +203,12 @@ fn test_notification() {
     run_test(ServerOpts::default(), |device| {
         let chan = device.client.get_notification_channel();
 
-        let attrib = Attributes::new(4, TransmissionMode::ServerOnChange,
-                                     Duration::from_secs(1), Duration::from_secs(1));
+        let attrib = Attributes::new(
+            4,
+            TransmissionMode::ServerOnChange,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
         device.write(0x4020, 0, &[4, 4, 1, 1]).unwrap();
         let handle = device.add_notification(0x4020, 0, &attrib).unwrap();
         device.write(0x4020, 0, &[8, 8, 1, 1]).unwrap();
@@ -192,22 +222,38 @@ fn test_notification() {
         println!("{:?}", first);
 
         let mut samples = first.samples();
-        assert_eq!(samples.next().unwrap(),
-                   Sample { handle, timestamp: 0x9988776655443322, data: &[4, 4, 1, 1] });
+        assert_eq!(
+            samples.next().unwrap(),
+            Sample {
+                handle,
+                timestamp: 0x9988776655443322,
+                data: &[4, 4, 1, 1]
+            }
+        );
         assert_eq!(samples.next(), None);
-        assert_eq!(second.samples().next().unwrap(),
-                   Sample { handle, timestamp: 0x9988776655443322, data: &[8, 8, 1, 1] });
+        assert_eq!(
+            second.samples().next().unwrap(),
+            Sample {
+                handle,
+                timestamp: 0x9988776655443322,
+                data: &[8, 8, 1, 1]
+            }
+        );
     })
 }
 
 #[test]
 fn test_multi_notification() {
-    use crate::notif::*;
     use crate::client::*;
+    use crate::notif::*;
     use std::time::Duration;
     run_test(ServerOpts::default(), |device| {
-        let attrib = Attributes::new(4, TransmissionMode::ServerOnChange,
-                                     Duration::from_secs(1), Duration::from_secs(1));
+        let attrib = Attributes::new(
+            4,
+            TransmissionMode::ServerOnChange,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
         let mut reqs = [
             AddNotifRequest::new(0x4020, 7, &attrib),
             AddNotifRequest::new(0x6789, 0, &attrib),
@@ -216,10 +262,7 @@ fn test_multi_notification() {
         let handle = reqs[0].handle().unwrap();
         assert!(reqs[1].handle().is_err());
 
-        let mut reqs = [
-            DelNotifRequest::new(handle),
-            DelNotifRequest::new(42),
-        ];
+        let mut reqs = [DelNotifRequest::new(handle), DelNotifRequest::new(42)];
         device.delete_notification_multi(&mut reqs).unwrap();
         assert!(reqs[0].ensure().is_ok());
         assert!(reqs[1].ensure().is_err());
@@ -230,19 +273,29 @@ fn test_multi_notification() {
 fn test_bad_notification() {
     use crate::notif::*;
     use std::time::Duration;
-    run_test(ServerOpts { bad_notif: true, .. Default::default() }, |device| {
-        let chan = device.client.get_notification_channel();
+    run_test(
+        ServerOpts {
+            bad_notif: true,
+            ..Default::default()
+        },
+        |device| {
+            let chan = device.client.get_notification_channel();
 
-        let attrib = Attributes::new(4, TransmissionMode::ServerOnChange,
-                                     Duration::from_secs(1), Duration::from_secs(1));
-        let _ = device.add_notification(0x4020, 0, &attrib).unwrap();
-        device.write(0x4020, 0, &[8, 8, 1, 1]).unwrap();
+            let attrib = Attributes::new(
+                4,
+                TransmissionMode::ServerOnChange,
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            );
+            let _ = device.add_notification(0x4020, 0, &attrib).unwrap();
+            device.write(0x4020, 0, &[8, 8, 1, 1]).unwrap();
 
-        // No notification should have come through.
-        assert!(chan.try_recv().is_err());
+            // No notification should have come through.
+            assert!(chan.try_recv().is_err());
 
-        // Notification is automatically deleted at end of scope.
-    })
+            // Notification is automatically deleted at end of scope.
+        },
+    )
 }
 
 #[test]
