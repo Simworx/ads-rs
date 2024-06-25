@@ -1,6 +1,6 @@
 //! Contains the TCP client to connect to an ADS server.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::convert::{TryFrom, TryInto};
 use std::io::{Read, Write};
 use std::mem::size_of;
@@ -15,7 +15,7 @@ use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use itertools::Itertools;
 
 use crate::errors::{ads_error, ErrContext};
-use crate::notif;
+use crate::{index, notif, Handle};
 use crate::{AmsAddr, AmsNetId, Error, Result};
 
 use crate::response::AdsResponse;
@@ -314,7 +314,11 @@ impl Client {
         if addr.netid() == AmsNetId::local() {
             addr = AmsAddr::new(self.source().netid(), addr.port());
         }
-        Device { client: self, addr }
+        Device {
+            client: self,
+            addr,
+            handles: Mutex::default(),
+        }
     }
 
     /// Low-level function to execute an ADS command.
@@ -572,14 +576,68 @@ impl Reader {
 }
 
 /// A `Client` wrapper that talks to a specific ADS device.
-#[derive(Clone, Copy)]
+
 pub struct Device<'c> {
     /// The underlying `Client`.
     pub client: &'c Client,
     addr: AmsAddr,
+    handles: Mutex<HashMap<String, u32>>,
 }
 
 impl<'c> Device<'c> {
+    ///cache
+    pub fn get_or_cache_handle(&'c self, symbol: &str) -> Result<u32> {
+        let mut handles = self.handles.lock().unwrap();
+
+        if handles.contains_key(symbol) {
+            return Ok(handles[symbol]);
+        } else {
+            match Handle::new(self, symbol) {
+                Ok(h) => {
+                    handles.insert(symbol.to_owned(), h.raw());
+                    return Ok(h.raw());
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Read data from a cached handle at the given symbol. (returned data must match size of buffer).
+    pub fn read_symbol(&self, symbol: &str, buf: &mut [u8]) -> Result<()> {
+        let handle = self.get_or_cache_handle(symbol)?;
+
+        self.read_exact(index::RW_SYMVAL_BYHANDLE, handle, buf)
+    }
+
+    /// Write data to the variable.
+    pub fn write_symbol(&self, symbol: &str, buf: &[u8]) -> Result<()> {
+        let handle = self.get_or_cache_handle(symbol)?;
+        self.write(index::RW_SYMVAL_BYHANDLE, handle, buf)
+    }
+
+    /// Read data of given type.
+    ///
+    /// Any type that supports `zerocopy::FromBytes` can be read.  You can also
+    /// derive that trait on your own structures and read structured data
+    /// directly from the symbol.
+    ///
+    /// Note: to be independent of the host's byte order, use the integer types
+    /// defined in `zerocopy::byteorder`.
+    pub fn read_symbol_value<T: Default + AsBytes + FromBytes>(&self, symbol: &str) -> Result<T> {
+        let handle = self.get_or_cache_handle(symbol)?;
+
+        self.read_value(index::RW_SYMVAL_BYHANDLE, handle)
+    }
+
+    /// Write data of given type.
+    ///
+    /// See `read_value` for details.
+    pub fn write_symbol_value<T: AsBytes>(&self, symbol: &str, value: &T) -> Result<()> {
+        let handle = self.get_or_cache_handle(symbol)?;
+
+        self.write_value(index::RW_SYMVAL_BYHANDLE, handle, value)
+    }
+
     /// Read the device's name + version.
     pub fn get_info(&self) -> Result<DeviceInfo> {
         let mut data = DeviceInfoRaw::new_zeroed();
