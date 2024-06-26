@@ -576,7 +576,6 @@ impl Reader {
 }
 
 /// A `Client` wrapper that talks to a specific ADS device.
-
 pub struct Device<'c> {
     /// The underlying `Client`.
     pub client: &'c Client,
@@ -589,7 +588,7 @@ impl<'c> Device<'c> {
     pub fn get_or_cache_handle(&'c self, symbol: &str) -> Result<u32> {
         let mut handles = match self.handles.lock() {
             Ok(h) => h,
-            Err(_) => return Err(Error::Other("Failed to aquire lock on handles")),
+            Err(_) => return Err(Error::Locking("Failed to aquire lock on handles")),
         };
 
         if handles.contains_key(symbol) {
