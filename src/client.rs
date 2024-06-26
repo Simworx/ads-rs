@@ -178,7 +178,10 @@ impl Drop for Client {
     fn drop(&mut self) {
         // Close all open notification handles.
         {
-            let handles = self.notif_handles.lock().unwrap();
+            let handles = match self.notif_handles.lock() {
+                Ok(h) => h,
+                Err(_) => return,
+            };
             for (addr, handle) in handles.iter() {
                 let _ = self.device(*addr).delete_notification(*handle);
             }
@@ -414,17 +417,15 @@ impl Client {
                 .find(|p| p.as_ref().is_ok_and(|f| f.invoke_id == invoke_id))
         };
 
-        if reply.is_none() {
-            return Err(Error::Reply(cmd.action(), "no response", 0));
-        }
+        let reply = match reply {
+            Some(r) => r,
+            None => return Err(Error::Reply(cmd.action(), "no response", 0)),
+        };
 
-        let reply = reply.unwrap();
-
-        if reply.is_err() {
-            return Err(reply.err().unwrap());
-        }
-
-        let reply = reply.unwrap();
+        let reply = match reply {
+            Ok(r) => r,
+            Err(e) => return Err(e),
+        };
 
         // Validate the incoming reply.  The reader thread already made sure that
         // it is consistent and addressed to us.
@@ -479,7 +480,10 @@ impl Client {
 
         // The pure user data length, without the result field.
         let data_len = reply.data_len as usize - 4;
-        let data = reply.data.unwrap();
+        let data = match reply.data {
+            Some(d) => d,
+            None => return Err(Error::Ads("Data not available", "", 0)),
+        };
 
         // Distribute the data into the user output buffers, up to the returned
         // data length.
@@ -1017,7 +1021,10 @@ impl<'c> Device<'c> {
         )?;
 
         {
-            let mut handles = self.client.notif_handles.lock().unwrap();
+            let mut handles = match self.client.notif_handles.lock() {
+                Ok(h) => h,
+                Err(_) => return Err(Error::Other("Could not aquire lock on notif_handles")),
+            };
             handles.insert((self.addr, handle.get()));
         }
         Ok(handle.get())
@@ -1051,7 +1058,10 @@ impl<'c> Device<'c> {
             .communicate(Command::ReadWrite, self.addr, &w_buffers, &mut r_buffers)?;
 
         {
-            let mut handles = self.client.notif_handles.lock().unwrap();
+            let mut handles = match self.client.notif_handles.lock() {
+                Ok(h) => h,
+                Err(_) => return Err(Error::Other("Could not aquire lock on notif_handles")),
+            };
             for req in requests {
                 if let Ok(handle) = req.handle() {
                     handles.insert((self.addr, handle));
@@ -1070,7 +1080,10 @@ impl<'c> Device<'c> {
             &mut [],
         )?;
         {
-            let mut handles = self.client.notif_handles.lock().unwrap();
+            let mut handles = match self.client.notif_handles.lock() {
+                Ok(h) => h,
+                Err(_) => return Err(Error::Other("Could not aquire lock on notif_handles")),
+            };
             handles.remove(&(self.addr, handle));
         }
         Ok(())
@@ -1104,8 +1117,10 @@ impl<'c> Device<'c> {
             .communicate(Command::ReadWrite, self.addr, &w_buffers, &mut r_buffers)?;
 
         {
-            let mut handles = self.client.notif_handles.lock().unwrap();
-
+            let mut handles = match self.client.notif_handles.lock() {
+                Ok(h) => h,
+                Err(_) => return Err(Error::Other("Could not aquire lock on notif_handles")),
+            };
             for req in requests {
                 if req.ensure().is_ok() {
                     handles.remove(&(self.addr, req.req.get()));
@@ -1503,20 +1518,32 @@ where
                     return Some(msg);
                 } else {
                     // Sleep for a short duration to avoid busy waiting
-                    let guard = mutex.lock().unwrap();
+                    let guard = match mutex.lock() {
+                        Ok(m) => m,
+                        Err(_) => return None,
+                    };
                     let remaining = timeout
                         .checked_sub(start.elapsed())
                         .unwrap_or_else(|| Duration::from_millis(0));
-                    let _ = condvar.wait_timeout(guard, remaining).unwrap();
+                    match condvar.wait_timeout(guard, remaining) {
+                        Ok(_) => {}
+                        Err(_) => return None,
+                    }
                 }
             }
             Err(TryRecvError::Empty) => {
                 // Sleep for a short duration to avoid busy waiting
-                let guard = mutex.lock().unwrap();
+                let guard = match mutex.lock() {
+                    Ok(m) => m,
+                    Err(_) => return None,
+                };
                 let remaining = timeout
                     .checked_sub(start.elapsed())
                     .unwrap_or_else(|| Duration::from_millis(0));
-                let _ = condvar.wait_timeout(guard, remaining).unwrap();
+                match condvar.wait_timeout(guard, remaining) {
+                    Ok(_) => {}
+                    Err(_) => return None,
+                }
             }
             Err(TryRecvError::Disconnected) => {
                 return None;
