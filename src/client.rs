@@ -587,7 +587,10 @@ pub struct Device<'c> {
 impl<'c> Device<'c> {
     ///cache
     pub fn get_or_cache_handle(&'c self, symbol: &str) -> Result<u32> {
-        let mut handles = self.handles.lock().unwrap();
+        let mut handles = match self.handles.lock() {
+            Ok(h) => h,
+            Err(_) => todo!(),
+        };
 
         if handles.contains_key(symbol) {
             return Ok(handles[symbol]);
