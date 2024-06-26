@@ -589,7 +589,7 @@ impl<'c> Device<'c> {
     pub fn get_or_cache_handle(&'c self, symbol: &str) -> Result<u32> {
         let mut handles = match self.handles.lock() {
             Ok(h) => h,
-            Err(_) => todo!(),
+            Err(_) => return Err(Error::Other("Failed to aquire lock on handles")),
         };
 
         if handles.contains_key(symbol) {
