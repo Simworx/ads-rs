@@ -10,14 +10,25 @@ use std::{
     net::{Shutdown, TcpStream},
 };
 use zerocopy::{ByteOrder, LE};
+
+pub const MAX_REQUEUE_AMOUNT: usize = 32;
+
+pub struct ResponseData {
+    pub data: Vec<u8>,
+    pub queued_count: usize,
+}
+
 // Implementation detail: reader thread that takes replies and notifications
 // and distributes them accordingly.
+
 pub struct Reader {
     pub socket: TcpStream,
     pub source: [u8; 8],
     pub buf_recv: Receiver<Vec<u8>>,
-    pub reply_send: Sender<Result<Vec<u8>>>,
+    pub reply_send: Sender<Result<ResponseData>>,
     pub notif_send: Sender<notif::Notification>,
+    /// Reciever for returned responses from the client thread that do not match the invoke_id of their request
+    pub buf_requeue: Receiver<ResponseData>,
 }
 
 impl Reader {
@@ -35,6 +46,20 @@ impl Reader {
                 .buf_recv
                 .try_recv()
                 .unwrap_or_else(|_| Vec::with_capacity(DEFAULT_BUFFER_SIZE));
+
+            //Requeue data that has been returned as not owned by a listening client.
+            for returned in self.buf_requeue.try_iter() {
+                if returned.queued_count > MAX_REQUEUE_AMOUNT {
+                    continue;
+                }
+
+                let returned = ResponseData {
+                    data: returned.data,
+                    queued_count: returned.queued_count + 1,
+                };
+
+                let _ = self.reply_send.send(Ok(returned));
+            }
 
             // Read a header from the socket.
             buf.resize(TCP_HEADER_SIZE, 0);
@@ -95,7 +120,14 @@ impl Reader {
             // If it looks like a reply, send it back to the requesting thread,
             // it will handle further validation.
             if LE::read_u16(&buf[22..24]) != Command::Notification as u16 {
-                if self.reply_send.send(Ok(buf)).is_err() {
+                if self
+                    .reply_send
+                    .send(Ok(ResponseData {
+                        data: buf,
+                        queued_count: 0,
+                    }))
+                    .is_err()
+                {
                     // Client must have been shut down.
                     return;
                 }

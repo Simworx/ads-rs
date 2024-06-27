@@ -1,4 +1,5 @@
 //! Contains the TCP client to connect to an ADS server.
+#[cfg(not(feature = "sync_send"))]
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::convert::TryInto;
@@ -15,7 +16,7 @@ use zerocopy::AsBytes;
 
 use crate::commands::{AdsHeader, Command};
 use crate::errors::{ads_error, ErrContext};
-use crate::reader::Reader;
+use crate::reader::{Reader, ResponseData, MAX_REQUEUE_AMOUNT};
 use crate::{notif, Source, Timeouts};
 use crate::{AmsAddr, AmsNetId, Error, Result};
 
@@ -45,8 +46,10 @@ pub struct Comms {
     pub source: AmsAddr,
     /// Sender for used Vec buffers to the reader thread
     pub buf_send: Sender<Vec<u8>>,
+    /// Sender for returning responses to the reader thread that do not match the invoke_id of the request
+    pub buf_requeue: Sender<ResponseData>,
     /// Receiver for synchronous replies: used in `communicate`
-    pub reply_recv: Receiver<Result<Vec<u8>>>,
+    pub reply_recv: Receiver<Result<ResponseData>>,
     /// Receiver for notifications: cloned and given out to interested parties
     pub notif_recv: Receiver<notif::Notification>,
     /// Active notification handles: these will be closed on Drop
@@ -173,7 +176,9 @@ impl Comms {
         // bidirectional communication.
         let socket_clone = socket.try_clone().ctx("cloning TCP socket")?;
         let (buf_send, buf_recv) = bounded(10);
-        let (reply_send, reply_recv) = bounded(1);
+        let (requeue_send, requeue_recv) = bounded(MAX_REQUEUE_AMOUNT);
+
+        let (reply_send, reply_recv) = bounded(MAX_REQUEUE_AMOUNT);
         let (notif_send, notif_recv) = unbounded();
         let mut source_bytes = [0; 8];
         source.write_to(&mut &mut source_bytes[..]).expect("size");
@@ -185,6 +190,7 @@ impl Comms {
             buf_recv,
             reply_send,
             notif_send,
+            buf_requeue: requeue_recv,
         };
         std::thread::spawn(|| reader.run());
 
@@ -201,6 +207,7 @@ impl Comms {
             #[cfg(feature = "sync_send")]
             notif_handles: Mutex::default(),
             source_port_opened,
+            buf_requeue: requeue_send,
         })
     }
 
@@ -263,39 +270,68 @@ impl Comms {
         // &T impls Write for T: Write, so no &mut self required.
         (&self.socket).write_all(&request).ctx("sending request")?;
 
-        // Get a reply from the reader thread, with timeout or not.
-        let reply = if let Some(tmo) = self.read_timeout {
-            self.reply_recv
-                .recv_timeout(tmo)
-                .map_err(|_| io::ErrorKind::TimedOut.into())
-                .ctx("receiving reply (route set?)")?
-        } else {
-            self.reply_recv
-                .recv()
-                .map_err(|_| io::ErrorKind::UnexpectedEof.into())
-                .ctx("receiving reply (route set?)")?
-        }?;
+        let mut reply_data: Vec<u8>;
+        let mut ret_cmd: u16;
+        let mut state_flags: u16;
+        let mut data_len: u32;
+        let mut error_code: u32;
+        let mut response_id: u32;
+        let mut result: u32;
 
-        // Validate the incoming reply.  The reader thread already made sure that
-        // it is consistent and addressed to us.
+        let mut recieve_trys = 0;
+        loop {
+            if recieve_trys > 0 && self.read_timeout.is_some() {
+                return Err(Error::Reply("Reply not recieved before timeout", "", 0));
+            }
 
-        // The source netid/port must match what we sent.
-        if reply[14..22] != request[6..14] {
-            return Err(Error::Reply(cmd.action(), "unexpected source address", 0));
+            // Get a reply from the reader thread, with timeout or not.
+            let reply = if let Some(tmo) = self.read_timeout {
+                self.reply_recv
+                    .recv_timeout(tmo)
+                    .map_err(|_| io::ErrorKind::TimedOut.into())
+                    .ctx("receiving reply (route set?)")?
+            } else {
+                self.reply_recv
+                    .recv()
+                    .map_err(|_| io::ErrorKind::UnexpectedEof.into())
+                    .ctx("receiving reply (route set?)")?
+            }?;
+
+            recieve_trys += 1;
+
+            reply_data = reply.data;
+            // Validate the incoming reply.  The reader thread already made sure that
+            // it is consistent and addressed to us.
+
+            // The source netid/port must match what we sent.
+            if reply_data[14..22] != request[6..14] {
+                return Err(Error::Reply(cmd.action(), "unexpected source address", 0));
+            }
+            // Read the other fields we need.
+            assert!(reply_data.len() >= AMS_HEADER_SIZE);
+            let mut ptr = &reply_data[22..];
+            ret_cmd = ptr.read_u16::<LE>().expect("size");
+            state_flags = ptr.read_u16::<LE>().expect("size");
+            data_len = ptr.read_u32::<LE>().expect("size");
+            error_code = ptr.read_u32::<LE>().expect("size");
+            response_id = ptr.read_u32::<LE>().expect("size");
+            result = if reply_data.len() >= AMS_HEADER_SIZE + 4 {
+                ptr.read_u32::<LE>().expect("size")
+            } else {
+                0 // this must be because an error code is already set
+            };
+
+            // Invoke ID must match what we sent.
+            if response_id != invoke_id {
+                let _ = self.buf_requeue.send(ResponseData {
+                    data: reply_data,
+                    queued_count: reply.queued_count,
+                });
+                continue;
+            }
+
+            break;
         }
-        // Read the other fields we need.
-        assert!(reply.len() >= AMS_HEADER_SIZE);
-        let mut ptr = &reply[22..];
-        let ret_cmd = ptr.read_u16::<LE>().expect("size");
-        let state_flags = ptr.read_u16::<LE>().expect("size");
-        let data_len = ptr.read_u32::<LE>().expect("size");
-        let error_code = ptr.read_u32::<LE>().expect("size");
-        let response_id = ptr.read_u32::<LE>().expect("size");
-        let result = if reply.len() >= AMS_HEADER_SIZE + 4 {
-            ptr.read_u32::<LE>().expect("size")
-        } else {
-            0 // this must be because an error code is already set
-        };
 
         // Command must match.
         if ret_cmd != cmd as u16 {
@@ -313,14 +349,7 @@ impl Comms {
                 state_flags.into(),
             ));
         }
-        // Invoke ID must match what we sent.
-        if response_id != invoke_id {
-            return Err(Error::Reply(
-                cmd.action(),
-                "unexpected invoke ID",
-                response_id,
-            ));
-        }
+
         // Check error code in AMS header.
         if error_code != 0 {
             return ads_error(cmd.action(), error_code);
@@ -332,7 +361,7 @@ impl Comms {
 
         // If we don't want return data, we're done.
         if data_out.is_empty() {
-            let _ = self.buf_send.send(reply);
+            let _ = self.buf_send.send(reply_data);
             return Ok(0);
         }
 
@@ -355,7 +384,7 @@ impl Comms {
         let mut rest_len = data_len;
         for buf in data_out {
             let n = buf.len().min(rest_len);
-            buf[..n].copy_from_slice(&reply[offset..][..n]);
+            buf[..n].copy_from_slice(&reply_data[offset..][..n]);
             offset += n;
             rest_len -= n;
             if rest_len == 0 {
@@ -364,7 +393,7 @@ impl Comms {
         }
 
         // Send back the Vec buffer to the reader thread.
-        let _ = self.buf_send.send(reply);
+        let _ = self.buf_send.send(reply_data);
 
         // Return either the error or the length of data.
         Ok(data_len)
