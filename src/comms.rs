@@ -6,7 +6,7 @@ use std::io::{self, Read, Write};
 use std::net::{IpAddr, Shutdown, TcpStream, ToSocketAddrs};
 
 use std::sync::atomic::AtomicU32;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use byteorder::{ByteOrder, ReadBytesExt, LE};
@@ -50,7 +50,11 @@ pub struct Comms {
     /// Receiver for notifications: cloned and given out to interested parties
     pub notif_recv: Receiver<notif::Notification>,
     /// Active notification handles: these will be closed on Drop
+    #[cfg(not(feature = "sync_send"))]
     pub notif_handles: RefCell<BTreeSet<(AmsAddr, notif::Handle)>>,
+    /// Active notification handles: these will be closed on Drop
+    #[cfg(feature = "sync_send")]
+    pub notif_handles: Mutex<BTreeSet<(AmsAddr, notif::Handle)>>,
     /// If we opened our local port with the router
     pub source_port_opened: bool,
 }
@@ -192,7 +196,10 @@ impl Comms {
             notif_recv,
             invoke_id: Arc::new(AtomicU32::new(0)),
             read_timeout: timeouts.read,
+            #[cfg(not(feature = "sync_send"))]
             notif_handles: RefCell::default(),
+            #[cfg(feature = "sync_send")]
+            notif_handles: Mutex::default(),
             source_port_opened,
         })
     }

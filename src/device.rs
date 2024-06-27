@@ -421,10 +421,21 @@ impl Device {
             &[data.as_bytes()],
             &mut [handle.as_bytes_mut()],
         )?;
+
+        #[cfg(not(feature = "sync_send"))]
         self.comms
             .notif_handles
             .borrow_mut()
             .insert((self.addr, handle.get()));
+        #[cfg(feature = "sync_send")]
+        {
+            let mut handles = match self.comms.notif_handles.lock() {
+                Ok(h) => h,
+                Err(_) => return Err(Error::Locking("notif_handles")),
+            };
+
+            handles.insert((self.addr, handle.get()));
+        }
         Ok(handle.get())
     }
 
@@ -456,10 +467,20 @@ impl Device {
             .communicate(Command::ReadWrite, self.addr, &w_buffers, &mut r_buffers)?;
         for req in requests {
             if let Ok(handle) = req.handle() {
+                #[cfg(not(feature = "sync_send"))]
                 self.comms
                     .notif_handles
                     .borrow_mut()
                     .insert((self.addr, handle));
+                #[cfg(feature = "sync_send")]
+                {
+                    let mut handles = match self.comms.notif_handles.lock() {
+                        Ok(h) => h,
+                        Err(_) => return Err(Error::Locking("notif_handles")),
+                    };
+
+                    handles.insert((self.addr, handle));
+                }
             }
         }
         Ok(())
@@ -473,10 +494,21 @@ impl Device {
             &[U32::<LE>::new(handle).as_bytes()],
             &mut [],
         )?;
+
+        #[cfg(not(feature = "sync_send"))]
         self.comms
             .notif_handles
             .borrow_mut()
             .remove(&(self.addr, handle));
+        #[cfg(feature = "sync_send")]
+        {
+            let mut handles = match self.comms.notif_handles.lock() {
+                Ok(h) => h,
+                Err(_) => return Err(Error::Locking("notif_handles")),
+            };
+
+            handles.remove(&(self.addr, handle));
+        }
         Ok(())
     }
 
@@ -508,10 +540,20 @@ impl Device {
             .communicate(Command::ReadWrite, self.addr, &w_buffers, &mut r_buffers)?;
         for req in requests {
             if req.ensure().is_ok() {
+                #[cfg(not(feature = "sync_send"))]
                 self.comms
                     .notif_handles
                     .borrow_mut()
                     .remove(&(self.addr, req.req.get()));
+                #[cfg(feature = "sync_send")]
+                {
+                    let mut handles = match self.comms.notif_handles.lock() {
+                        Ok(h) => h,
+                        Err(_) => return Err(Error::Locking("notif_handles")),
+                    };
+
+                    handles.remove(&(self.addr, req.req.get()));
+                }
             }
         }
         Ok(())
@@ -523,7 +565,11 @@ impl Drop for Device {
         let mut handles = self.handles.lock().unwrap();
         handles.clear();
 
+        #[cfg(not(feature = "sync_send"))]
         let handles = std::mem::take(&mut *self.comms.notif_handles.borrow_mut());
+        #[cfg(feature = "sync_send")]
+        let handles = std::mem::take(&mut *self.comms.notif_handles.lock().unwrap());
+
         for (addr, handle) in handles {
             if addr == self.addr {
                 let _ = self.delete_notification(handle);
