@@ -38,6 +38,7 @@
 
 pub mod client;
 mod commands;
+pub mod comms;
 pub mod device;
 pub mod errors;
 pub mod file;
@@ -50,13 +51,13 @@ mod source;
 mod state;
 pub mod strings;
 pub mod symbol;
-//#[cfg(test)]
-//mod test;
+#[cfg(test)]
+mod test;
 mod timeouts;
 pub mod udp;
 mod utils;
 
-pub use client::Client;
+pub use comms::Comms;
 pub use device::Device;
 pub use errors::{Error, Result};
 pub use file::File;

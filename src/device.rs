@@ -6,30 +6,97 @@ use crate::commands::{
     AddNotif, AddNotifRequest, DelNotifRequest, IndexLength, IndexLengthRW, ReadRequest, ReadState,
     ResultLength, WriteControl, WriteReadRequest, WriteRequest,
 };
-use crate::errors::Result;
+
 use crate::utils::fixup_write_read_return_buffers;
 use crate::{
     commands::{Command, DeviceInfo, DeviceInfoRaw},
-    AmsAddr, Client,
+    AmsAddr, Comms,
 };
-use crate::{notif, AdsState, Error};
+use crate::{errors::*, notif, AdsState, Error, Handle};
+use std::collections::HashMap;
 use std::convert::{TryFrom, TryInto};
 use std::mem::size_of;
+use std::sync::{Arc, Mutex};
 
 /// A `Client` wrapper that talks to a specific ADS device.
-#[derive(Clone, Copy)]
-pub struct Device<'c> {
+#[derive(Clone, Debug)]
+pub struct Device {
     /// The underlying `Client`.
-    pub client: &'c Client,
+    pub comms: Arc<Comms>,
     ///The address of the device
     pub addr: AmsAddr,
+    /// Cache of handles
+    handles: Arc<Mutex<HashMap<String, Handle>>>,
+
+    //Self reference for building handles
+    self_ref: Arc<Mutex<Option<Arc<Device>>>>,
 }
 
-impl<'c> Device<'c> {
+//TODO: Decide if this is needed.
+// #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+// pub enum Location {
+//     Exact(u32, u32),
+//     Symbol(&'static str),
+// }
+
+// impl Location {
+//     fn Resolve(&self, device: &Device) -> Result<(u32, u32)> {
+//         match self {
+//             Location::Exact(index_group, offset) => Ok((index_group.clone(), offset.clone())),
+//             Location::Symbol(symbol) => match device.handles.lock() {
+//                 Ok(handles) => {
+//                     match handles.get(symbol) {
+//                         Some(h) => h.raw,
+//                         None => todo!(),
+//                     }
+//                 }
+//                 Err(_) => todo!(),
+//             },
+//         }
+//     }
+// }
+
+impl Device {
+    pub fn new(comms: Arc<Comms>, addr: AmsAddr) -> Arc<Self> {
+        let device = Arc::new(Device {
+            comms,
+            addr,
+            handles: Arc::new(Mutex::new(HashMap::new())),
+            self_ref: Arc::new(Mutex::new(None)),
+        });
+
+        // Initialize the self_ref field
+        {
+            let mut self_ref = device.self_ref.lock().unwrap();
+            *self_ref = Some(device.clone());
+        }
+
+        device
+    }
+
+    pub fn handle(&self, symbol: &str) -> Result<Handle> {
+        match self.handles.lock() {
+            Ok(mut handles) => match handles.get(symbol) {
+                Some(h) => Ok(h.clone()),
+                None => {
+                    //TODO: Error handling.
+                    let handle = Handle::new(
+                        self.self_ref.lock().unwrap().as_ref().unwrap().clone(),
+                        symbol,
+                    )?;
+                    handles.insert(symbol.to_string(), handle);
+
+                    Ok(handles.get(symbol).unwrap().clone())
+                }
+            },
+            Err(_) => Err(Error::Locking("device handles")),
+        }
+    }
+
     /// Read the device's name + version.
     pub fn get_info(&self) -> Result<DeviceInfo> {
         let mut data = DeviceInfoRaw::new_zeroed();
-        self.client
+        self.comms
             .communicate(Command::DevInfo, self.addr, &[], &mut [data.as_bytes_mut()])?;
 
         // Decode the name string, which is null-terminated.  Technically it's
@@ -58,7 +125,7 @@ impl<'c> Device<'c> {
         };
         let mut read_len = U32::<LE>::new(0);
 
-        self.client.communicate(
+        self.comms.communicate(
             Command::Read,
             self.addr,
             &[header.as_bytes()],
@@ -151,7 +218,7 @@ impl<'c> Device<'c> {
             r_buffers[1 + i] = req.res.as_bytes_mut();
             r_buffers[1 + nreq + i] = req.rbuf;
         }
-        self.client
+        self.comms
             .communicate(Command::ReadWrite, self.addr, &w_buffers, &mut r_buffers)?;
         Ok(())
     }
@@ -163,7 +230,7 @@ impl<'c> Device<'c> {
             index_offset: U32::new(index_offset),
             length: U32::new(data.len().try_into()?),
         };
-        self.client.communicate(
+        self.comms.communicate(
             Command::Write,
             self.addr,
             &[header.as_bytes(), data],
@@ -213,7 +280,7 @@ impl<'c> Device<'c> {
             w_buffers[1 + nreq + i] = req.wbuf;
             r_buffers.push(req.res.as_bytes_mut());
         }
-        self.client
+        self.comms
             .communicate(Command::ReadWrite, self.addr, &w_buffers, &mut r_buffers)?;
         Ok(())
     }
@@ -235,7 +302,7 @@ impl<'c> Device<'c> {
             write_length: U32::new(write_data.len().try_into()?),
         };
         let mut read_len = U32::<LE>::new(0);
-        self.client.communicate(
+        self.comms.communicate(
             Command::ReadWrite,
             self.addr,
             &[header.as_bytes(), write_data],
@@ -298,7 +365,7 @@ impl<'c> Device<'c> {
             r_buffers[1 + i] = req.res.as_bytes_mut();
             r_buffers[1 + nreq + i] = req.rbuf;
         }
-        self.client
+        self.comms
             .communicate(Command::ReadWrite, self.addr, &w_buffers, &mut r_buffers)?;
         // unfortunately SUMUP_READWRITE returns only the actual read bytes for each
         // request, so if there are short reads the buffers got filled wrongly
@@ -309,7 +376,7 @@ impl<'c> Device<'c> {
     /// Return the ADS and device state of the device.
     pub fn get_state(&self) -> Result<(AdsState, u16)> {
         let mut state = ReadState::new_zeroed();
-        self.client.communicate(
+        self.comms.communicate(
             Command::ReadState,
             self.addr,
             &[],
@@ -330,7 +397,7 @@ impl<'c> Device<'c> {
             dev_state: U16::new(dev_state),
             data_length: U32::new(0),
         };
-        self.client.communicate(
+        self.comms.communicate(
             Command::WriteControl,
             self.addr,
             &[data.as_bytes()],
@@ -363,13 +430,13 @@ impl<'c> Device<'c> {
             reserved: [0; 16],
         };
         let mut handle = U32::<LE>::new(0);
-        self.client.communicate(
+        self.comms.communicate(
             Command::AddNotification,
             self.addr,
             &[data.as_bytes()],
             &mut [handle.as_bytes_mut()],
         )?;
-        self.client
+        self.comms
             .notif_handles
             .borrow_mut()
             .insert((self.addr, handle.get()));
@@ -400,11 +467,11 @@ impl<'c> Device<'c> {
             w_buffers.push(req.req.as_bytes());
             r_buffers.push(req.res.as_bytes_mut());
         }
-        self.client
+        self.comms
             .communicate(Command::ReadWrite, self.addr, &w_buffers, &mut r_buffers)?;
         for req in requests {
             if let Ok(handle) = req.handle() {
-                self.client
+                self.comms
                     .notif_handles
                     .borrow_mut()
                     .insert((self.addr, handle));
@@ -415,13 +482,13 @@ impl<'c> Device<'c> {
 
     /// Delete a notification with given handle.
     pub fn delete_notification(&self, handle: notif::Handle) -> Result<()> {
-        self.client.communicate(
+        self.comms.communicate(
             Command::DeleteNotification,
             self.addr,
             &[U32::<LE>::new(handle).as_bytes()],
             &mut [],
         )?;
-        self.client
+        self.comms
             .notif_handles
             .borrow_mut()
             .remove(&(self.addr, handle));
@@ -452,16 +519,30 @@ impl<'c> Device<'c> {
             w_buffers.push(req.req.as_bytes());
             r_buffers.push(req.res.as_bytes_mut());
         }
-        self.client
+        self.comms
             .communicate(Command::ReadWrite, self.addr, &w_buffers, &mut r_buffers)?;
         for req in requests {
             if req.ensure().is_ok() {
-                self.client
+                self.comms
                     .notif_handles
                     .borrow_mut()
                     .remove(&(self.addr, req.req.get()));
             }
         }
         Ok(())
+    }
+}
+
+impl Drop for Device {
+    fn drop(&mut self) {
+        let mut handles = self.handles.lock().unwrap();
+        handles.clear();
+
+        let handles = std::mem::take(&mut *self.comms.notif_handles.borrow_mut());
+        for (addr, handle) in handles {
+            if addr == self.addr {
+                let _ = self.delete_notification(handle);
+            }
+        }
     }
 }

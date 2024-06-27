@@ -1,6 +1,6 @@
 use crate::{
-    client::{AMS_HEADER_SIZE, DEFAULT_BUFFER_SIZE, TCP_HEADER_SIZE},
     commands::Command,
+    comms::{AMS_HEADER_SIZE, DEFAULT_BUFFER_SIZE, TCP_HEADER_SIZE},
     errors::{ErrContext, Result},
     notif, Error,
 };

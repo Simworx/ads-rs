@@ -105,7 +105,7 @@ pub(crate) struct DeviceInfoRaw {
 
 #[derive(FromBytes, AsBytes)]
 #[repr(C)]
-pub(crate) struct IndexLength {
+pub struct IndexLength {
     pub index_group: U32<LE>,
     pub index_offset: U32<LE>,
     pub length: U32<LE>,
@@ -113,14 +113,14 @@ pub(crate) struct IndexLength {
 
 #[derive(FromBytes, AsBytes)]
 #[repr(C)]
-pub(crate) struct ResultLength {
+pub struct ResultLength {
     pub result: U32<LE>,
     pub length: U32<LE>,
 }
 
 #[derive(FromBytes, AsBytes)]
 #[repr(C)]
-pub(crate) struct IndexLengthRW {
+pub struct IndexLengthRW {
     pub index_group: U32<LE>,
     pub index_offset: U32<LE>,
     pub read_length: U32<LE>,
@@ -144,7 +144,7 @@ pub(crate) struct WriteControl {
 
 #[derive(FromBytes, AsBytes)]
 #[repr(C)]
-pub(crate) struct AddNotif {
+pub struct AddNotif {
     pub index_group: U32<LE>,
     pub index_offset: U32<LE>,
     pub length: U32<LE>,

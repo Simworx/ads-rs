@@ -19,7 +19,7 @@ use zerocopy::{AsBytes, FromBytes};
 /// Although often the first 4 bytes of a NetID look like an IP address, and
 /// sometimes even are identical to the device's IP address, there is no
 /// requirement for this, and one should never rely on it.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Debug, AsBytes, FromBytes)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Debug, AsBytes, FromBytes, Hash)]
 #[repr(C)]
 pub struct AmsNetId(pub [u8; 6]);
 
@@ -86,7 +86,7 @@ impl Display for AmsNetId {
 }
 
 /// Combination of an AMS NetID and a port.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AmsAddr(AmsNetId, AmsPort);
 
 impl AmsAddr {
@@ -125,9 +125,14 @@ impl FromStr for AmsAddr {
 
     /// Parse an AMS address from a string (netid:port).
     fn from_str(s: &str) -> Result<AmsAddr, &'static str> {
-        let (addr, port) = s.split(':').collect_tuple()
-                                       .ok_or("invalid AMS addr string")?;
-        Ok(Self(addr.parse()?, port.parse().map_err(|_| "invalid port number")?))
+        let (addr, port) = s
+            .split(':')
+            .collect_tuple()
+            .ok_or("invalid AMS addr string")?;
+        Ok(Self(
+            addr.parse()?,
+            port.parse().map_err(|_| "invalid port number")?,
+        ))
     }
 }
 
