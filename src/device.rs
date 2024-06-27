@@ -1,4 +1,4 @@
-#![allow(missing_docs)]
+//! Provides functionality for working with an ADS connection at a device level.
 use itertools::Itertools;
 use zerocopy::{AsBytes, FromBytes, LE, U16, U32};
 
@@ -32,31 +32,8 @@ pub struct Device {
     self_ref: Arc<Mutex<Option<Arc<Device>>>>,
 }
 
-//TODO: Decide if this is needed.
-// #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-// pub enum Location {
-//     Exact(u32, u32),
-//     Symbol(&'static str),
-// }
-
-// impl Location {
-//     fn Resolve(&self, device: &Device) -> Result<(u32, u32)> {
-//         match self {
-//             Location::Exact(index_group, offset) => Ok((index_group.clone(), offset.clone())),
-//             Location::Symbol(symbol) => match device.handles.lock() {
-//                 Ok(handles) => {
-//                     match handles.get(symbol) {
-//                         Some(h) => h.raw,
-//                         None => todo!(),
-//                     }
-//                 }
-//                 Err(_) => todo!(),
-//             },
-//         }
-//     }
-// }
-
 impl Device {
+    ///Creates a new device.
     pub fn new(comms: Arc<Comms>, addr: AmsAddr) -> Arc<Self> {
         let device = Arc::new(Device {
             comms,
@@ -74,16 +51,24 @@ impl Device {
         device
     }
 
+    ///Either instantiates a handle and resolves it's memory location, or retrieves it from a cache.
     pub fn handle(&self, symbol: &str) -> Result<Handle> {
         match self.handles.lock() {
             Ok(mut handles) => match handles.get(symbol) {
                 Some(h) => Ok(h.clone()),
                 None => {
-                    //TODO: Error handling.
-                    let handle = Handle::new(
-                        self.self_ref.lock().unwrap().as_ref().unwrap().clone(),
-                        symbol,
-                    )?;
+                    let self_ref = match self.self_ref.lock() {
+                        Ok(opt) => {
+                            if opt.is_none() {
+                                return Err(Error::Locking("self_ref on Device"));
+                            } else {
+                                opt.clone().unwrap()
+                            }
+                        }
+                        Err(_) => return Err(Error::Locking("self_ref on Device")),
+                    };
+
+                    let handle = Handle::new(self_ref.clone(), symbol)?;
                     handles.insert(symbol.to_string(), handle);
 
                     Ok(handles.get(symbol).unwrap().clone())

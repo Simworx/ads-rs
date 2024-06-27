@@ -1,4 +1,4 @@
-#![allow(missing_docs)]
+//! Describes the client, which is the top level object used for ADS connections.
 
 use std::{
     collections::HashMap,
@@ -6,14 +6,18 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use crate::{errors::*, notif, AmsAddr, AmsNetId, Comms, Device, Source, Timeouts};
 use crossbeam_channel::Receiver;
 
-use crate::{errors::*, notif, AmsAddr, AmsNetId, Comms, Device, Source, Timeouts};
-
-/// TODO: Document.
-
+/// Represents a connection to a ADS server.
+///
+/// The Client's communication methods use `&self`, so that it can be freely
+/// shared within one thread, or sent, between threads.  Wrappers such as
+/// `Device` or `symbol::Handle` use a `&Client` as well.
 pub struct Client {
+    /// The comms object that is shared between devices and handles.
     comms: Arc<Comms>,
+    /// Cache of referenced devices. Allows for handle caching.
     devices: Mutex<HashMap<AmsAddr, Arc<Device>>>,
 }
 

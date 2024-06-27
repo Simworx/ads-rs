@@ -29,7 +29,7 @@ pub(crate) const DEFAULT_BUFFER_SIZE: usize = 100;
 
 /// Represents a connection to a ADS server.
 ///
-/// The Client's communication methods use `&self`, so that it can be freely
+/// The Comm's communication methods use `&self`, so that it can be freely
 /// shared within one thread, or sent, between threads.  Wrappers such as
 /// `Device` or `symbol::Handle` use a `&Client` as well.
 #[derive(Debug)]
