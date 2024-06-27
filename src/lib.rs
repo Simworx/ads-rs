@@ -57,6 +57,7 @@ mod timeouts;
 pub mod udp;
 mod utils;
 
+pub use client::Client;
 pub use comms::Comms;
 pub use device::Device;
 pub use errors::{Error, Result};
