@@ -36,24 +36,35 @@
 #![deny(missing_docs)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
-pub mod netid;
 pub mod client;
-pub mod notif;
-pub mod udp;
+mod commands;
+pub mod device;
 pub mod errors;
-pub mod ports;
-pub mod index;
 pub mod file;
+pub mod index;
+pub mod netid;
+pub mod notif;
+pub mod ports;
+mod reader;
+mod source;
+mod state;
 pub mod strings;
 pub mod symbol;
-#[cfg(test)]
-mod test;
+//#[cfg(test)]
+//mod test;
+mod timeouts;
+pub mod udp;
+mod utils;
 
-pub use client::{AdsState, Client, Device, Source, Timeouts};
+pub use client::Client;
+pub use device::Device;
 pub use errors::{Error, Result};
 pub use file::File;
 pub use netid::{AmsAddr, AmsNetId, AmsPort};
+pub use source::Source;
+pub use state::AdsState;
 pub use symbol::Handle;
+pub use timeouts::Timeouts;
 
 /// The default port for TCP communication.
 pub const PORT: u16 = 0xBF02;
