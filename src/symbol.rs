@@ -728,8 +728,15 @@ fn decode_type_info_by_name(data: &[u8]) -> Result<Type> {
         let name = String::from_utf8_lossy(&buf[..len_name]).into_owned();
         ptr.read_exact(&mut buf[..len_type + 1]).ctx(ctx)?;
         let type_name = String::from_utf8_lossy(&buf[..len_type]).into_owned();
-        ptr.read_exact(&mut buf[..len_comment + 1]).ctx(ctx)?;
-        let comment = String::from_utf8_lossy(&buf[..len_comment]).into_owned();
+        
+        let comment = if len_comment + 1 > buf.len() {
+            let mut comment_buf = vec![0; len_comment + 1];
+            ptr.read_exact(&mut comment_buf).ctx(ctx)?;
+            String::from_utf8_lossy(&comment_buf[..len_comment]).into_owned()
+        } else {
+            ptr.read_exact(&mut buf[..len_comment + 1]).ctx(ctx)?;
+            String::from_utf8_lossy(&buf[..len_comment]).into_owned()
+        };
 
         let mut array = vec![];
         for _ in 0..array_dim {
