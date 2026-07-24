@@ -306,15 +306,36 @@ const TYPE_FLAG_ENUM_INFOS: u32 = 0x2000;
 const RPC_METHOD_ATTRIBUTE_FLAG: u32 = 0x08;
 const RPC_PARAM_ATTRIBUTE_FLAG: u32 = 0x40;
 
+/// Hard ceiling on a declared string-field length. TwinCAT names and comments
+/// are far shorter than this; a length beyond it means a corrupt or malicious
+/// response, so we reject it rather than attempt to decode it.
+const MAX_STR_LEN: usize = 8196;
+
 /// Read a length-prefixed, null-terminated string: `len` content bytes followed
 /// by a terminating null byte.
 ///
-/// The buffer is heap-allocated to fit `len`, so arbitrarily long names,
-/// comments, and attribute values decode without overflowing a fixed buffer.
+/// A `len` above [`MAX_STR_LEN`] is rejected outright as a bad actor / corrupt
+/// data. Otherwise, when the field fits within the remaining input it is sliced
+/// straight out of it; if the declared length runs past the end of the data we
+/// read whatever is left into a fresh buffer (best effort) and leave `ptr`
+/// empty, so the caller can carry on.
 fn read_str(ptr: &mut &[u8], len: usize) -> Result<String> {
-    let mut bytes = vec![0u8; len + 1];
-    ptr.read_exact(&mut bytes).ctx("reading string")?;
-    Ok(String::from_utf8_lossy(&bytes[..len]).into_owned())
+    if len > MAX_STR_LEN {
+        return Err(Error::Reply("reading string", "string length exceeds maximum", len as u32));
+    }
+    let total = len + 1; // content bytes + null terminator
+    if total > ptr.len() {
+        // Reads past the end: grab everything that's left into a new buffer.
+        let mut buf = vec![0u8; ptr.len()];
+        ptr.read_exact(&mut buf).ctx("reading string")?;
+        let content = len.min(buf.len());
+        Ok(String::from_utf8_lossy(&buf[..content]).into_owned())
+    } else {
+        // Fits: slice the field straight out of the input and advance past it.
+        let (field, rest) = ptr.split_at(total);
+        *ptr = rest;
+        Ok(String::from_utf8_lossy(&field[..len]).into_owned())
+    }
 }
 
 fn parse_guid(ptr: &mut &[u8]) -> Result<String> {
