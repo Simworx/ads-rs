@@ -306,6 +306,17 @@ const TYPE_FLAG_ENUM_INFOS: u32 = 0x2000;
 const RPC_METHOD_ATTRIBUTE_FLAG: u32 = 0x08;
 const RPC_PARAM_ATTRIBUTE_FLAG: u32 = 0x40;
 
+/// Read a length-prefixed, null-terminated string: `len` content bytes followed
+/// by a terminating null byte.
+///
+/// The buffer is heap-allocated to fit `len`, so arbitrarily long names,
+/// comments, and attribute values decode without overflowing a fixed buffer.
+fn read_str(ptr: &mut &[u8], len: usize) -> Result<String> {
+    let mut bytes = vec![0u8; len + 1];
+    ptr.read_exact(&mut bytes).ctx("reading string")?;
+    Ok(String::from_utf8_lossy(&bytes[..len]).into_owned())
+}
+
 fn parse_guid(ptr: &mut &[u8]) -> Result<String> {
     let ctx = "parsing GUID";
     let mut g = [0u8; 16];
@@ -337,14 +348,11 @@ fn parse_attributes(ptr: &mut &[u8]) -> Result<Vec<Attribute>> {
     let ctx = "parsing attributes";
     let count = ptr.read_u16::<LE>().ctx(ctx)? as usize;
     let mut attrs = Vec::with_capacity(count);
-    let mut buf = [0u8; 256];
     for _ in 0..count {
         let name_len = ptr.read_u8().ctx(ctx)? as usize;
         let value_len = ptr.read_u8().ctx(ctx)? as usize;
-        ptr.read_exact(&mut buf[..name_len + 1]).ctx(ctx)?;
-        let name = String::from_utf8_lossy(&buf[..name_len]).into_owned();
-        ptr.read_exact(&mut buf[..value_len + 1]).ctx(ctx)?;
-        let value = String::from_utf8_lossy(&buf[..value_len]).into_owned();
+        let name = read_str(ptr, name_len)?;
+        let value = read_str(ptr, value_len)?;
         attrs.push(Attribute { name, value });
     }
     Ok(attrs)
@@ -354,11 +362,9 @@ fn parse_enum_infos(ptr: &mut &[u8], size: usize, base_type: u32) -> Result<Vec<
     let ctx = "parsing enum infos";
     let count = ptr.read_u16::<LE>().ctx(ctx)? as usize;
     let mut enums = Vec::with_capacity(count);
-    let mut buf = [0u8; 256];
     for _ in 0..count {
         let name_len = ptr.read_u8().ctx(ctx)? as usize;
-        ptr.read_exact(&mut buf[..name_len + 1]).ctx(ctx)?;
-        let name = String::from_utf8_lossy(&buf[..name_len]).into_owned();
+        let name = read_str(ptr, name_len)?;
         let mut raw = vec![0u8; size];
         ptr.read_exact(&mut raw).ctx(ctx)?;
         let value: i64 = match base_type {
@@ -403,7 +409,6 @@ fn parse_method_infos(ptr: &mut &[u8]) -> Result<Vec<RpcMethod>> {
 
 fn parse_rpc_method(mut ptr: &[u8]) -> Result<RpcMethod> {
     let ctx = "parsing RPC method";
-    let mut buf = [0u8; 2048];
 
     let _version = ptr.read_u32::<LE>().ctx(ctx)?;
     let _v_table_index = ptr.read_u32::<LE>().ctx(ctx)?;
@@ -420,12 +425,9 @@ fn parse_rpc_method(mut ptr: &[u8]) -> Result<RpcMethod> {
     let comment_len = ptr.read_u16::<LE>().ctx(ctx)? as usize;
     let param_count = ptr.read_u16::<LE>().ctx(ctx)? as usize;
 
-    ptr.read_exact(&mut buf[..name_len + 1]).ctx(ctx)?;
-    let name = String::from_utf8_lossy(&buf[..name_len]).into_owned();
-    ptr.read_exact(&mut buf[..return_type_len + 1]).ctx(ctx)?;
-    let return_type = String::from_utf8_lossy(&buf[..return_type_len]).into_owned();
-    ptr.read_exact(&mut buf[..comment_len + 1]).ctx(ctx)?;
-    let comment = String::from_utf8_lossy(&buf[..comment_len]).into_owned();
+    let name = read_str(&mut ptr, name_len)?;
+    let return_type = read_str(&mut ptr, return_type_len)?;
+    let comment = read_str(&mut ptr, comment_len)?;
 
     let mut parameters = Vec::with_capacity(param_count);
     for _ in 0..param_count {
@@ -448,7 +450,6 @@ fn parse_rpc_method(mut ptr: &[u8]) -> Result<RpcMethod> {
 
 fn parse_rpc_method_parameter(mut ptr: &[u8]) -> Result<RpcMethodParameter> {
     let ctx = "parsing RPC method parameter";
-    let mut buf = [0u8; 2048];
 
     let size = ptr.read_u32::<LE>().ctx(ctx)? as usize;
     let _align_size = ptr.read_u32::<LE>().ctx(ctx)?;
@@ -463,12 +464,9 @@ fn parse_rpc_method_parameter(mut ptr: &[u8]) -> Result<RpcMethodParameter> {
     let type_len = ptr.read_u16::<LE>().ctx(ctx)? as usize;
     let comment_len = ptr.read_u16::<LE>().ctx(ctx)? as usize;
 
-    ptr.read_exact(&mut buf[..name_len + 1]).ctx(ctx)?;
-    let name = String::from_utf8_lossy(&buf[..name_len]).into_owned();
-    ptr.read_exact(&mut buf[..type_len + 1]).ctx(ctx)?;
-    let typ = String::from_utf8_lossy(&buf[..type_len]).into_owned();
-    ptr.read_exact(&mut buf[..comment_len + 1]).ctx(ctx)?;
-    let comment = String::from_utf8_lossy(&buf[..comment_len]).into_owned();
+    let name = read_str(&mut ptr, name_len)?;
+    let typ = read_str(&mut ptr, type_len)?;
+    let comment = read_str(&mut ptr, comment_len)?;
 
     let mut attributes = Vec::new();
     if flags & RPC_PARAM_ATTRIBUTE_FLAG != 0 {
@@ -521,6 +519,96 @@ fn parse_field_attributes(ptr: &mut &[u8], flags: u32, size: usize) -> Result<Op
     }
 }
 
+/// Decode a single type-info record from the binary stream.
+///
+/// When `parent` is `Some`, the record is decoded as a field and pushed onto
+/// that parent's field list (returning `Ok(None)`); otherwise it is decoded as
+/// a top-level [`Type`] (returning `Ok(Some(_))`).
+///
+/// The 8 header bytes after the version differ between the two stream formats
+/// that carry type info — the bulk `SYM_DT_UPLOAD` format (subitem index / PLC
+/// interface id / reserved) and the `GET_TYPEINFO_BYNAME_EX` format (hash /
+/// type hash) — but both are unused, so a single decoder handles both.
+fn decode_type_info(mut ptr: &[u8], parent: Option<&mut Type>) -> Result<Option<Type>> {
+    let ctx = "decoding type info";
+
+    let version = ptr.read_u32::<LE>().ctx(ctx)?;
+    if version != 1 {
+        return Err(Error::Reply(ctx, "unknown type info version", version));
+    }
+    // 8-byte header, unused in both stream formats (see doc comment).
+    let mut header = [0u8; 8];
+    ptr.read_exact(&mut header).ctx(ctx)?;
+    let size = ptr.read_u32::<LE>().ctx(ctx)? as usize;
+    let offset = ptr.read_u32::<LE>().ctx(ctx)?;
+    let base_type = ptr.read_u32::<LE>().ctx(ctx)?;
+    let flags = ptr.read_u32::<LE>().ctx(ctx)?;
+    let len_name = ptr.read_u16::<LE>().ctx(ctx)? as usize;
+    let len_type = ptr.read_u16::<LE>().ctx(ctx)? as usize;
+    let len_comment = ptr.read_u16::<LE>().ctx(ctx)? as usize;
+    let array_dim = ptr.read_u16::<LE>().ctx(ctx)?;
+    let sub_items = ptr.read_u16::<LE>().ctx(ctx)?;
+
+    let name = read_str(&mut ptr, len_name)?;
+    let type_name = read_str(&mut ptr, len_type)?;
+    let comment = read_str(&mut ptr, len_comment)?;
+
+    let mut array = vec![];
+    for _ in 0..array_dim {
+        let lower = ptr.read_i32::<LE>().ctx(ctx)?;
+        let total = ptr.read_i32::<LE>().ctx(ctx)?;
+        array.push((lower, lower + total - 1));
+    }
+
+    if let Some(parent) = parent {
+        let attributes = parse_field_attributes(&mut ptr, flags, size)?;
+        // Offset -1 marks that the field is placed somewhere else in memory
+        // (e.g. AT %Mxx).
+        let offset = if offset == 0xFFFF_FFFF { None } else { Some(offset) };
+        parent.fields.push(Field {
+            name,
+            typ: type_name,
+            offset,
+            size,
+            array,
+            base_type,
+            flags,
+            comment,
+            attributes,
+        });
+        Ok(None)
+    } else {
+        let mut typinfo = Type {
+            name,
+            type_name,
+            comment,
+            size,
+            array,
+            base_type,
+            flags,
+            fields: Vec::new(),
+            guid: None,
+            methods: None,
+            attributes: None,
+            enum_info: None,
+        };
+
+        for _ in 0..sub_items {
+            let sub_size = ptr.read_u32::<LE>().ctx(ctx)? as usize;
+            if sub_size < 4 {
+                return Err(Error::Reply(ctx, "invalid sub-item entry length", sub_size as u32));
+            }
+            let (sub_ptr, rest) = ptr.split_at(sub_size - 4);
+            decode_type_info(sub_ptr, Some(&mut typinfo))?;
+            ptr = rest;
+        }
+
+        parse_type_flags(&mut ptr, &mut typinfo)?;
+
+        Ok(Some(typinfo))
+    }
+}
+
 /// A mapping from type name to type.
 pub type TypeMap = HashMap<String, Type>;
 /// Get and decode symbol and type information from the PLC.
@@ -550,96 +638,8 @@ pub fn get_symbol_info(device: Device<'_>) -> Result<(Vec<Symbol>, TypeMap)> {
 /// Returns a list of symbols, and a map of type names to types.
 pub fn decode_symbol_info(symbol_data: Vec<u8>, type_data: Vec<u8>) -> Result<(Vec<Symbol>, TypeMap)> {
     // Decode the type info.
-    let mut buf = [0; 1024];
     let mut data_ptr = type_data.as_slice();
     let mut type_map = HashMap::new();
-
-    fn decode_type_info(mut ptr: &[u8], parent: Option<&mut Type>) -> Result<Option<Type>> {
-        let ctx = "decoding type info";
-
-        let mut buf = [0; 1024];
-        let version = ptr.read_u32::<LE>().ctx(ctx)?;
-        if version != 1 {
-            return Err(Error::Reply(ctx, "unknown type info version", version));
-        }
-        let _subitem_index = ptr.read_u16::<LE>().ctx(ctx)?;
-        let _plc_interface_id = ptr.read_u16::<LE>().ctx(ctx)?;
-        let _reserved = ptr.read_u32::<LE>().ctx(ctx)?;
-        let size = ptr.read_u32::<LE>().ctx(ctx)? as usize;
-        let offset = ptr.read_u32::<LE>().ctx(ctx)?;
-        let base_type = ptr.read_u32::<LE>().ctx(ctx)?;
-        let flags = ptr.read_u32::<LE>().ctx(ctx)?;
-        let len_name = ptr.read_u16::<LE>().ctx(ctx)? as usize;
-        let len_type = ptr.read_u16::<LE>().ctx(ctx)? as usize;
-        let len_comment = ptr.read_u16::<LE>().ctx(ctx)? as usize;
-        let array_dim = ptr.read_u16::<LE>().ctx(ctx)?;
-        let sub_items = ptr.read_u16::<LE>().ctx(ctx)?;
-        ptr.read_exact(&mut buf[..len_name + 1]).ctx(ctx)?;
-        let name = String::from_utf8_lossy(&buf[..len_name]).into_owned();
-        ptr.read_exact(&mut buf[..len_type + 1]).ctx(ctx)?;
-        let type_name = String::from_utf8_lossy(&buf[..len_type]).into_owned();
-        let comment = if len_comment + 1 > buf.len() {
-            let mut comment_buf = vec![0; len_comment + 1];
-            ptr.read_exact(&mut comment_buf).ctx(ctx)?;
-            String::from_utf8_lossy(&comment_buf[..len_comment]).into_owned()
-        } else {
-            ptr.read_exact(&mut buf[..len_comment + 1]).ctx(ctx)?;
-            String::from_utf8_lossy(&buf[..len_comment]).into_owned()
-        };
-        let mut array = vec![];
-        for _ in 0..array_dim {
-            let lower = ptr.read_i32::<LE>().ctx(ctx)?;
-            let total = ptr.read_i32::<LE>().ctx(ctx)?;
-            array.push((lower, lower + total - 1));
-        }
-
-        if let Some(parent) = parent {
-            assert_eq!(sub_items, 0);
-            let attributes = parse_field_attributes(&mut ptr, flags, size)?;
-            // Offset -1 marks that the field is placed somewhere else in memory
-            // (e.g. AT %Mxx).
-            let offset = if offset == 0xFFFF_FFFF { None } else { Some(offset) };
-            parent.fields.push(Field {
-                name,
-                typ: type_name,
-                offset,
-                size,
-                array,
-                base_type,
-                flags,
-                comment,
-                attributes,
-            });
-            Ok(None)
-        } else {
-            assert_eq!(offset, 0);
-            let mut typinfo = Type {
-                name,
-                type_name,
-                comment,
-                size,
-                array,
-                base_type,
-                flags,
-                fields: Vec::new(),
-                guid: None,
-                methods: None,
-                attributes: None,
-                enum_info: None,
-            };
-
-            for _ in 0..sub_items {
-                let sub_size = ptr.read_u32::<LE>().ctx(ctx)? as usize;
-                let (sub_ptr, rest) = ptr.split_at(sub_size - 4);
-                decode_type_info(sub_ptr, Some(&mut typinfo))?;
-                ptr = rest;
-            }
-
-            parse_type_flags(&mut ptr, &mut typinfo)?;
-
-            Ok(Some(typinfo))
-        }
-    }
 
     while !data_ptr.is_empty() {
         let entry_size = data_ptr.read_u32::<LE>().ctx("decoding type info")? as usize;
@@ -665,10 +665,8 @@ pub fn decode_symbol_info(symbol_data: Vec<u8>, type_data: Vec<u8>) -> Result<(V
         let len_name = entry_ptr.read_u16::<LE>().ctx(ctx)? as usize;
         let len_type = entry_ptr.read_u16::<LE>().ctx(ctx)? as usize;
         let _len_comment = entry_ptr.read_u16::<LE>().ctx(ctx)? as usize;
-        entry_ptr.read_exact(&mut buf[..len_name + 1]).ctx(ctx)?;
-        let name = String::from_utf8_lossy(&buf[..len_name]).into_owned();
-        entry_ptr.read_exact(&mut buf[..len_type + 1]).ctx(ctx)?;
-        let typ = String::from_utf8_lossy(&buf[..len_type]).into_owned();
+        let name = read_str(&mut entry_ptr, len_name)?;
+        let typ = read_str(&mut entry_ptr, len_type)?;
         // following fields (variable length), which we jump over:
         // - comment with \0
         // - type GUID if flags has Type GUID
@@ -707,90 +705,5 @@ pub fn get_type_info_by_name(device: Device<'_>, type_name: &str) -> Result<Type
 /// second and third u32 fields are `hash` and `type_hash` instead of
 /// `subitem_index`/`plc_interface_id`/`reserved`.
 fn decode_type_info_by_name(data: &[u8]) -> Result<Type> {
-    fn decode_entry(mut ptr: &[u8], parent: Option<&mut Type>) -> Result<Option<Type>> {
-        let ctx = "decoding type info by name";
-        let mut buf = [0u8; 1024];
-
-        let _version = ptr.read_u32::<LE>().ctx(ctx)?;
-        let _hash = ptr.read_u32::<LE>().ctx(ctx)?;
-        let _type_hash = ptr.read_u32::<LE>().ctx(ctx)?;
-        let size = ptr.read_u32::<LE>().ctx(ctx)? as usize;
-        let offset = ptr.read_u32::<LE>().ctx(ctx)?;
-        let base_type = ptr.read_u32::<LE>().ctx(ctx)?;
-        let flags = ptr.read_u32::<LE>().ctx(ctx)?;
-        let len_name = ptr.read_u16::<LE>().ctx(ctx)? as usize;
-        let len_type = ptr.read_u16::<LE>().ctx(ctx)? as usize;
-        let len_comment = ptr.read_u16::<LE>().ctx(ctx)? as usize;
-        let array_dim = ptr.read_u16::<LE>().ctx(ctx)? as usize;
-        let sub_item_count = ptr.read_u16::<LE>().ctx(ctx)? as usize;
-
-        ptr.read_exact(&mut buf[..len_name + 1]).ctx(ctx)?;
-        let name = String::from_utf8_lossy(&buf[..len_name]).into_owned();
-        ptr.read_exact(&mut buf[..len_type + 1]).ctx(ctx)?;
-        let type_name = String::from_utf8_lossy(&buf[..len_type]).into_owned();
-        
-        let comment = if len_comment + 1 > buf.len() {
-            let mut comment_buf = vec![0; len_comment + 1];
-            ptr.read_exact(&mut comment_buf).ctx(ctx)?;
-            String::from_utf8_lossy(&comment_buf[..len_comment]).into_owned()
-        } else {
-            ptr.read_exact(&mut buf[..len_comment + 1]).ctx(ctx)?;
-            String::from_utf8_lossy(&buf[..len_comment]).into_owned()
-        };
-
-        let mut array = vec![];
-        for _ in 0..array_dim {
-            let lower = ptr.read_i32::<LE>().ctx(ctx)?;
-            let total = ptr.read_i32::<LE>().ctx(ctx)?;
-            array.push((lower, lower + total - 1));
-        }
-
-        if let Some(parent) = parent {
-            let attributes = parse_field_attributes(&mut ptr, flags, size)?;
-            let offset = if offset == 0xFFFF_FFFF { None } else { Some(offset) };
-            parent.fields.push(Field {
-                name,
-                typ: type_name,
-                offset,
-                size,
-                array,
-                base_type,
-                flags,
-                comment,
-                attributes,
-            });
-            Ok(None)
-        } else {
-            let mut typinfo = Type {
-                name,
-                type_name,
-                comment,
-                size,
-                array,
-                base_type,
-                flags,
-                fields: Vec::new(),
-                guid: None,
-                methods: None,
-                attributes: None,
-                enum_info: None,
-            };
-
-            for _ in 0..sub_item_count {
-                let sub_size = ptr.read_u32::<LE>().ctx(ctx)? as usize;
-                if sub_size < 4 {
-                    return Err(Error::Reply(ctx, "invalid sub-item entry length", sub_size as u32));
-                }
-                let (sub_ptr, rest) = ptr.split_at(sub_size - 4);
-                decode_entry(sub_ptr, Some(&mut typinfo))?;
-                ptr = rest;
-            }
-
-            parse_type_flags(&mut ptr, &mut typinfo)?;
-
-            Ok(Some(typinfo))
-        }
-    }
-
-    decode_entry(data, None)?.ok_or(Error::Other("expected top-level type"))
+    decode_type_info(data, None)?.ok_or(Error::Other("expected top-level type"))
 }
