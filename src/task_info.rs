@@ -7,7 +7,8 @@
 use std::convert::TryInto;
 use std::time::Duration;
 
-use crate::{Device, Error, Result};
+use crate::symbol::Type;
+use crate::{AmsAddr, Device, Error, Result};
 
 /// The `_TaskInfo` symbol exposed by `Tc2_System`.
 pub const TASK_INFO_SYMBOL: &str = "TwinCAT_SystemInfoVarList._TaskInfo";
@@ -39,8 +40,8 @@ pub struct TaskInfoLocation {
 /// The validated layout of one `_TaskInfo` array entry.
 ///
 /// Build this from the entry type in the caller's symbol metadata cache. The
-/// required TwinCAT fields occupy the documented 32-byte prefix. Task names are
-/// decoded only after the caller has validated the `TaskName: STRING(63)` field.
+/// constructor validates the documented fields' offsets, sizes, and ADS base
+/// types. Task names are decoded only when their `STRING(63)` field is present.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TaskInfoLayout {
     entry_size: usize,
@@ -48,34 +49,60 @@ pub struct TaskInfoLayout {
 }
 
 impl TaskInfoLayout {
-    /// Create a layout for an entry with the supplied size and no optional name.
-    pub fn new(entry_size: usize) -> Result<Self> {
-        if entry_size < TASK_PREFIX_SIZE {
-            return Err(Error::Reply(
-                "creating task info layout",
-                "task entry is shorter than documented prefix",
-                entry_size as u32,
-            ));
-        }
-        Ok(Self { entry_size, task_name_offset: None })
-    }
-
-    /// Decode a validated inline `TaskName: STRING(63)` field at `offset`.
+    /// Validate and create a layout from the `_TaskInfo` array element type.
     ///
-    /// Call this only after inspecting type metadata and confirming the field's
-    /// type and 64-byte size. It rejects a field that does not fit the entry.
-    pub fn with_task_name(mut self, offset: usize) -> Result<Self> {
-        if offset < TASK_PREFIX_SIZE
-            || offset.checked_add(TASK_NAME_SIZE).map_or(true, |end| end > self.entry_size)
-        {
-            return Err(Error::Reply(
-                "creating task info layout",
-                "task name field does not fit task entry",
-                offset as u32,
-            ));
+    /// The caller must resolve aliases before passing this type: fields must
+    /// retain their ADS primitive base types in the supplied metadata.
+    pub fn from_entry_type(entry: &Type) -> Result<Self> {
+        if entry.size < TASK_PREFIX_SIZE {
+            return Err(Error::TaskInfoLayout("task entry is shorter than documented prefix"));
         }
-        self.task_name_offset = Some(offset);
-        Ok(self)
+
+        let required = [
+            ("ObjId", 0, 4, 19),
+            ("CycleTime", 4, 4, 19),
+            ("Priority", 8, 2, 18),
+            ("AdsPort", 10, 2, 18),
+            ("CycleCount", 12, 4, 19),
+            ("DcTaskTime", 16, 8, 20),
+            ("LastExecTime", 24, 4, 19),
+            ("FirstCycle", 28, 1, 33),
+            ("CycleTimeExceeded", 29, 1, 33),
+            ("InCallAfterOutputUpdate", 30, 1, 33),
+            ("RTViolation", 31, 1, 33),
+        ];
+        for (name, offset, size, base_type) in required {
+            let field = entry
+                .fields
+                .iter()
+                .find(|field| field.name == name)
+                .ok_or(Error::TaskInfoLayout("a required task field is missing"))?;
+            if field.offset != Some(offset)
+                || field.size != size
+                || field.base_type != base_type
+                || !field.array.is_empty()
+            {
+                return Err(Error::TaskInfoLayout(
+                    "a required task field has an unsupported type, size, or offset",
+                ));
+            }
+        }
+
+        let task_name_offset = match entry.fields.iter().find(|field| field.name == "TaskName") {
+            Some(field)
+                if field.offset == Some(TASK_PREFIX_SIZE as u32)
+                    && field.size == TASK_NAME_SIZE
+                    && field.base_type == 30
+                    && field.array.is_empty() =>
+            {
+                Some(TASK_PREFIX_SIZE)
+            }
+            Some(_) => {
+                return Err(Error::TaskInfoLayout("TaskName has an unsupported type, size, or offset"))
+            }
+            None => None,
+        };
+        Ok(Self { entry_size: entry.size, task_name_offset })
     }
 
     /// Return the byte size of one task entry.
@@ -101,7 +128,7 @@ pub struct PlcTaskSystemInfo {
     pub cycle_time: Duration,
     /// Duration of the last completed cycle.
     pub last_exec_time: Duration,
-    /// Distributed-clock task time in 100 ns ticks.
+    /// Signed distributed-clock task time in nanoseconds.
     pub dc_task_time: i64,
     /// Wrapping completed-cycle counter.
     pub cycle_count: u32,
@@ -146,7 +173,8 @@ pub struct PlcTaskInfoSnapshot {
     /// The application's reported task count, when an app-info location was
     /// supplied to the reader.
     pub reported_task_count: Option<ReportedTaskCount>,
-    /// Populated task entries, retaining their original array indices.
+    /// Task entries, retaining their original array indices, including entries
+    /// whose configured cycle time is zero.
     pub tasks: Vec<PlcTaskSystemInfo>,
 }
 
@@ -163,12 +191,15 @@ impl PlcTaskInfoSnapshot {
 
 /// Cached, validated metadata used to read TwinCAT task telemetry.
 ///
-/// `TaskInfoReader` does not discover symbols. Pass locations from an uploaded
-/// symbol table or another caller-owned cache, then reuse this value for each
-/// sample. Recreate it after reconnecting, downloading a project, an online
-/// change, or any other symbol metadata refresh.
+/// `TaskInfoReader` does not discover symbols. Pass locations and array bounds
+/// from an uploaded symbol table or another caller-owned cache, then reuse this
+/// value for each sample. `symbol_generation` is owned by that cache; callers
+/// must compare it with their current generation before every read and recreate
+/// this reader after reconnecting, downloading a project, or an online change.
 #[derive(Debug, Clone, Copy)]
 pub struct TaskInfoReader {
+    target: AmsAddr,
+    symbol_generation: u64,
     task_info: TaskInfoLocation,
     app_info: Option<TaskInfoLocation>,
     layout: TaskInfoLayout,
@@ -176,48 +207,50 @@ pub struct TaskInfoReader {
 }
 
 impl TaskInfoReader {
-    /// Create a reader for a resolved `_TaskInfo` location and its array element
-    /// layout from type metadata.
+    /// Create a reader for one target and symbol-metadata generation.
     ///
-    /// The layout's element size must divide the complete task symbol size.
-    pub fn new(task_info: TaskInfoLocation, layout: TaskInfoLayout) -> Result<Self> {
+    /// `array_bounds` are the one-dimensional `_TaskInfo` bounds from symbol
+    /// metadata. They must exactly describe the supplied symbol's size.
+    pub fn new(
+        target: AmsAddr, symbol_generation: u64, task_info: TaskInfoLocation, array_bounds: (i32, i32),
+        layout: TaskInfoLayout,
+    ) -> Result<Self> {
+        let (first_index, last_index) = array_bounds;
+        let count = last_index
+            .checked_sub(first_index)
+            .filter(|count| *count >= 0)
+            .and_then(|n| n.checked_add(1))
+            .ok_or(Error::TaskInfoLayout("task array bounds are invalid"))? as usize;
         if task_info.size == 0
             || task_info.size > MAX_TASK_INFO_SIZE
-            || task_info.size % layout.entry_size != 0
+            || count.checked_mul(layout.entry_size) != Some(task_info.size)
         {
-            return Err(Error::Reply(
-                "creating task info reader",
-                "unsupported task-info layout",
-                task_info.size as u32,
-            ));
+            return Err(Error::TaskInfoLayout("task array bounds and symbol size disagree"));
         }
-        Ok(Self { task_info, app_info: None, layout, first_index: 1 })
+        Ok(Self { target, symbol_generation, task_info, app_info: None, layout, first_index })
     }
 
     /// Include a resolved `_AppInfo` location so [`Self::read`] also attempts to
     /// obtain `TaskCnt`. A failure there leaves task data available in the snapshot.
     pub fn with_app_info(mut self, app_info: TaskInfoLocation) -> Result<Self> {
         if app_info.size < APP_INFO_TASK_COUNT_SIZE {
-            return Err(Error::Reply(
-                "creating task info reader",
-                "app-info symbol is shorter than TaskCnt",
-                app_info.size as u32,
-            ));
+            return Err(Error::TaskInfoLayout("app-info symbol is shorter than TaskCnt"));
         }
         self.app_info = Some(app_info);
         Ok(self)
     }
 
-    /// Set the lower bound of the PLC `_TaskInfo` array. TwinCAT's standard
-    /// symbol uses one, which is the default.
+    /// Return the caller-owned symbol metadata generation for this reader.
     #[must_use]
-    pub fn with_first_index(mut self, first_index: i32) -> Self {
-        self.first_index = first_index;
-        self
+    pub fn symbol_generation(&self) -> u64 {
+        self.symbol_generation
     }
 
     /// Read and decode the configured task-info symbol from `device`.
     pub fn read(&self, device: Device<'_>) -> Result<PlcTaskInfoSnapshot> {
+        if device.address() != self.target {
+            return Err(Error::TaskInfoLayout("reader was used with a different ADS target"));
+        }
         let mut bytes = vec![0; self.task_info.size];
         device.read_exact(self.task_info.index_group, self.task_info.index_offset, &mut bytes)?;
         let tasks = self.decode_tasks(&bytes)?;
@@ -247,9 +280,7 @@ impl TaskInfoReader {
                 ))?,
                 self.layout.task_name_offset,
             )?;
-            if !task.cycle_time.is_zero() {
-                tasks.push(task);
-            }
+            tasks.push(task);
         }
         Ok(tasks)
     }
@@ -300,11 +331,68 @@ fn decode_task(entry: &[u8], index: i32, task_name_offset: Option<usize>) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const TASK_NAME_OFFSET: usize = 32;
+    use crate::symbol::Field;
 
     fn location(size: usize) -> TaskInfoLocation {
         TaskInfoLocation { index_group: 0x4020, index_offset: 100, size }
+    }
+
+    fn field(name: &str, offset: u32, size: usize, base_type: u32) -> Field {
+        Field {
+            name: name.into(),
+            typ: name.into(),
+            offset: Some(offset),
+            size,
+            array: vec![],
+            base_type,
+            flags: 0,
+            comment: String::new(),
+            attributes: None,
+        }
+    }
+
+    fn entry_type(with_name: bool) -> Type {
+        let mut fields = vec![
+            field("ObjId", 0, 4, 19),
+            field("CycleTime", 4, 4, 19),
+            field("Priority", 8, 2, 18),
+            field("AdsPort", 10, 2, 18),
+            field("CycleCount", 12, 4, 19),
+            field("DcTaskTime", 16, 8, 20),
+            field("LastExecTime", 24, 4, 19),
+            field("FirstCycle", 28, 1, 33),
+            field("CycleTimeExceeded", 29, 1, 33),
+            field("InCallAfterOutputUpdate", 30, 1, 33),
+            field("RTViolation", 31, 1, 33),
+        ];
+        if with_name {
+            fields.push(field("TaskName", 32, 64, 30));
+        }
+        Type {
+            name: "PlcTaskSystemInfo".into(),
+            type_name: "PlcTaskSystemInfo".into(),
+            comment: String::new(),
+            size: if with_name { 96 } else { 32 },
+            array: vec![],
+            fields,
+            base_type: 65,
+            flags: 0,
+            guid: None,
+            methods: None,
+            attributes: None,
+            enum_info: None,
+        }
+    }
+
+    fn reader(size: usize, with_name: bool) -> TaskInfoReader {
+        TaskInfoReader::new(
+            AmsAddr::default(),
+            7,
+            location(size),
+            (1, 1),
+            TaskInfoLayout::from_entry_type(&entry_type(with_name)).expect("layout"),
+        )
+        .expect("reader")
     }
 
     fn entry(size: usize, cycle_ticks: u32) -> Vec<u8> {
@@ -321,8 +409,7 @@ mod tests {
 
     #[test]
     fn documented_prefix_decodes() {
-        let layout = TaskInfoLayout::new(32).expect("layout");
-        let reader = TaskInfoReader::new(location(32), layout).expect("reader");
+        let reader = reader(32, false);
         let tasks = reader.decode_tasks(&entry(32, 100_000)).expect("task");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].index, 1);
@@ -333,11 +420,7 @@ mod tests {
 
     #[test]
     fn documented_name_is_decoded_without_creating_extra_tasks() {
-        let layout = TaskInfoLayout::new(96)
-            .expect("layout")
-            .with_task_name(TASK_NAME_OFFSET)
-            .expect("name field");
-        let reader = TaskInfoReader::new(location(96), layout).expect("reader");
+        let reader = reader(96, true);
         let mut bytes = entry(96, 100_000);
         bytes[32..41].copy_from_slice(b"FastTask\0");
         let tasks = reader.decode_tasks(&bytes).expect("task");
@@ -346,21 +429,28 @@ mod tests {
     }
 
     #[test]
-    fn layout_requires_metadata_element_size() {
-        let layout = TaskInfoLayout::new(32).expect("layout");
-        assert!(TaskInfoReader::new(location(96), layout).is_ok());
-        assert!(TaskInfoReader::new(location(95), layout).is_err());
-        assert!(TaskInfoLayout::new(31).is_err());
+    fn layout_requires_metadata_fields_and_array_bounds() {
+        let mut invalid = entry_type(false);
+        invalid.fields[0].offset = Some(4);
+        assert!(TaskInfoLayout::from_entry_type(&invalid).is_err());
+
+        let layout = TaskInfoLayout::from_entry_type(&entry_type(true)).expect("layout");
+        assert!(TaskInfoReader::new(AmsAddr::default(), 7, location(96), (1, 1), layout).is_ok());
+        // A 96-byte extended entry must not be treated as three 32-byte entries.
+        let legacy = TaskInfoLayout::from_entry_type(&entry_type(false)).expect("legacy layout");
+        assert!(TaskInfoReader::new(AmsAddr::default(), 7, location(96), (1, 1), legacy).is_err());
+        assert!(TaskInfoReader::new(AmsAddr::default(), 7, location(96), (2, 1), layout).is_err());
     }
 
     #[test]
     fn empty_slots_keep_their_original_index() {
-        let layout = TaskInfoLayout::new(32).expect("layout");
-        let reader = TaskInfoReader::new(location(96), layout).expect("reader");
+        let layout = TaskInfoLayout::from_entry_type(&entry_type(false)).expect("layout");
+        let reader =
+            TaskInfoReader::new(AmsAddr::default(), 7, location(96), (1, 3), layout).expect("reader");
         let mut bytes = entry(32, 100_000);
         bytes.extend_from_slice(&entry(32, 0));
         bytes.extend_from_slice(&entry(32, 10_000));
         let tasks = reader.decode_tasks(&bytes).expect("tasks");
-        assert_eq!(tasks.iter().map(|task| task.index).collect::<Vec<_>>(), vec![1, 3]);
+        assert_eq!(tasks.iter().map(|task| task.index).collect::<Vec<_>>(), vec![1, 2, 3]);
     }
 }
