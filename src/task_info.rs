@@ -93,7 +93,8 @@ impl TaskInfoLayout {
                 if field.offset == Some(TASK_PREFIX_SIZE as u32)
                     && field.size == TASK_NAME_SIZE
                     && field.base_type == 30
-                    && field.array.is_empty() =>
+                    && field.array.is_empty()
+                    && TASK_PREFIX_SIZE + TASK_NAME_SIZE <= entry.size =>
             {
                 Some(TASK_PREFIX_SIZE)
             }
@@ -115,8 +116,8 @@ impl TaskInfoLayout {
 /// A configured TwinCAT task, as reported by `_TaskInfo`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlcTaskSystemInfo {
-    /// Original PLC array index. This is one-based by default; use
-    /// [`TaskInfoReader::with_first_index`] for another array lower bound.
+    /// Original PLC array index, using the metadata bounds supplied to
+    /// [`TaskInfoReader::new`].
     pub index: i32,
     /// TwinCAT object identifier.
     pub object_id: u32,
@@ -168,6 +169,11 @@ pub enum ReportedTaskCount {
 }
 
 /// One task sample and its optional application-wide task count.
+///
+/// The number of array entries is not the number of monitored tasks: unused
+/// slots are retained. Consumers determine coverage using their own validated
+/// task-selection policy and the reported count; this snapshot does not infer
+/// completeness from array capacity.
 #[derive(Debug)]
 pub struct PlcTaskInfoSnapshot {
     /// The application's reported task count, when an app-info location was
@@ -178,24 +184,24 @@ pub struct PlcTaskInfoSnapshot {
     pub tasks: Vec<PlcTaskSystemInfo>,
 }
 
-impl PlcTaskInfoSnapshot {
-    /// Return the number of tasks the fixed `_TaskInfo` array cannot expose.
-    #[must_use]
-    pub fn unmonitored_task_count(&self) -> Option<u32> {
-        match self.reported_task_count.as_ref()? {
-            ReportedTaskCount::Available(count) => Some(count.saturating_sub(self.tasks.len() as u32)),
-            ReportedTaskCount::Unavailable(_) => None,
-        }
-    }
-}
-
 /// Cached, validated metadata used to read TwinCAT task telemetry.
 ///
 /// `TaskInfoReader` does not discover symbols. Pass locations and array bounds
 /// from an uploaded symbol table or another caller-owned cache, then reuse this
 /// value for each sample. `symbol_generation` is owned by that cache; callers
-/// must compare it with their current generation before every read and recreate
-/// this reader after reconnecting, downloading a project, or an online change.
+/// must pass their current generation to every read and recreate this reader
+/// after reconnecting, downloading a project, or an online change.
+///
+/// The cache must monitor the target's symbol version (ADS index group
+/// [`crate::index::GET_SYMVERSION`]) using polling or symbol-version notifications.
+/// On a version change, invalidate cached locations and advance the local
+/// generation before rebuilding metadata and readers. Reconnects must also
+/// advance the generation, even if the target reports the same version. If a
+/// version check fails, suspend sampling until metadata validity is established.
+/// A local generation alone cannot detect changes on the target, and successful
+/// direct address reads are not evidence that cached metadata is still valid.
+/// Version checks and value reads are separate operations: changes can race a
+/// sample, so discard it when a version change is observed during sampling.
 #[derive(Debug, Clone, Copy)]
 pub struct TaskInfoReader {
     target: AmsAddr,
@@ -247,7 +253,16 @@ impl TaskInfoReader {
     }
 
     /// Read and decode the configured task-info symbol from `device`.
-    pub fn read(&self, device: Device<'_>) -> Result<PlcTaskInfoSnapshot> {
+    ///
+    /// Pass the current generation from the caller's symbol cache. A mismatch
+    /// returns [`Error::TaskInfoInvalidated`] before any ADS requests are sent.
+    /// This performs one value read, plus one when app-info is configured; it
+    /// performs no discovery or symbol-version checks. The two value reads do
+    /// not form an atomic snapshot. See the reader's cache invalidation contract.
+    pub fn read(&self, device: Device<'_>, current_generation: u64) -> Result<PlcTaskInfoSnapshot> {
+        if current_generation != self.symbol_generation {
+            return Err(Error::TaskInfoInvalidated);
+        }
         if device.address() != self.target {
             return Err(Error::TaskInfoLayout("reader was used with a different ADS target"));
         }
@@ -452,5 +467,57 @@ mod tests {
         bytes.extend_from_slice(&entry(32, 10_000));
         let tasks = reader.decode_tasks(&bytes).expect("tasks");
         assert_eq!(tasks.iter().map(|task| task.index).collect::<Vec<_>>(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn rejects_task_name_outside_entry() {
+        for size in [32, 64, 95] {
+            let mut metadata = entry_type(true);
+            metadata.size = size;
+            assert!(matches!(
+                TaskInfoLayout::from_entry_type(&metadata),
+                Err(Error::TaskInfoLayout(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn truncated_data_is_a_reply_error() {
+        assert!(matches!(reader(96, true).decode_tasks(&[0; 95]), Err(Error::Reply(..))));
+    }
+
+    #[test]
+    fn reader_reads_values_and_preserves_count_failure() {
+        let port = crate::test::config_test_server(Default::default());
+        let client =
+            crate::Client::new(("127.0.0.1", port), crate::Timeouts::none(), crate::Source::Auto).unwrap();
+        let device = client.device(AmsAddr::new(crate::AmsNetId::new(1, 2, 3, 4, 5, 6), 851));
+        let mut reader = reader(32, false);
+        reader.target = device.address();
+        // The fake server supports value reads here, but no type discovery.
+        device.write(0x4020, 100, &entry(32, 100_000)).unwrap();
+        device.write(0x4020, 204, &3u32.to_le_bytes()).unwrap();
+        let app = TaskInfoLocation { index_group: 0x4020, index_offset: 200, size: 8 };
+        let reader = reader.with_app_info(app).unwrap();
+        for _ in 0..2 {
+            let snapshot = reader.read(device, 7).unwrap();
+            assert_eq!(snapshot.tasks.len(), 1);
+            assert!(matches!(snapshot.reported_task_count, Some(ReportedTaskCount::Available(3))));
+        }
+        let reader = reader.with_app_info(TaskInfoLocation { index_group: 0xffff, ..app }).unwrap();
+        let snapshot = reader.read(device, 7).unwrap();
+        assert_eq!(snapshot.tasks[0].cycle_count, 42);
+        assert!(matches!(
+            snapshot.reported_task_count,
+            Some(ReportedTaskCount::Unavailable(Error::Ads(..)))
+        ));
+
+        assert!(matches!(reader.read(device, 8), Err(Error::TaskInfoInvalidated)));
+        let other = client.device(AmsAddr::new(device.address().netid(), 852));
+        assert!(matches!(reader.read(other, 7), Err(Error::TaskInfoLayout(_))));
+
+        let mut failed = reader;
+        failed.task_info.index_group = 0xffff;
+        assert!(matches!(failed.read(device, 7), Err(Error::Ads(..))));
     }
 }
