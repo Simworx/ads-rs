@@ -90,13 +90,16 @@ impl TaskInfoLayout {
 
         let task_name_offset = match entry.fields.iter().find(|field| field.name == "TaskName") {
             Some(field)
-                if field.offset == Some(TASK_PREFIX_SIZE as u32)
+                if field.offset.map_or(false, |offset| {
+                    let offset = offset as usize;
+                    offset >= TASK_PREFIX_SIZE
+                        && offset.checked_add(TASK_NAME_SIZE).map_or(false, |end| end <= entry.size)
+                })
                     && field.size == TASK_NAME_SIZE
                     && field.base_type == 30
-                    && field.array.is_empty()
-                    && TASK_PREFIX_SIZE + TASK_NAME_SIZE <= entry.size =>
+                    && field.array.is_empty() =>
             {
-                Some(TASK_PREFIX_SIZE)
+                field.offset.map(|offset| offset as usize)
             }
             Some(_) => {
                 return Err(Error::TaskInfoLayout("TaskName has an unsupported type, size, or offset"))
@@ -441,6 +444,44 @@ mod tests {
         let tasks = reader.decode_tasks(&bytes).expect("task");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].name.as_deref(), Some("FastTask"));
+    }
+
+    #[test]
+    fn plc_name_at_offset_64_uses_128_byte_stride() {
+        // Layout captured from Timmy_Dev's uploaded PLC metadata.
+        let mut metadata = entry_type(true);
+        metadata.size = 128;
+        metadata.fields.last_mut().unwrap().offset = Some(64);
+        let layout = TaskInfoLayout::from_entry_type(&metadata).expect("PLC layout");
+        let reader = TaskInfoReader::new(AmsAddr::default(), 7, location(256), (1, 2), layout)
+            .expect("reader");
+        let mut first = entry(128, 10_000);
+        first[32..64].fill(0xff); // The gap must not be decoded as a name or task.
+        first[64..73].copy_from_slice(b"FastTask\0");
+        let mut second = entry(128, 100_000);
+        second[64..73].copy_from_slice(b"SlowTask\0");
+        first.extend_from_slice(&second);
+        let tasks = reader.decode_tasks(&first).expect("tasks");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].index, 1);
+        assert_eq!(tasks[0].name.as_deref(), Some("FastTask"));
+        assert_eq!(tasks[0].cycle_time, Duration::from_millis(1));
+        assert_eq!(tasks[1].index, 2);
+        assert_eq!(tasks[1].name.as_deref(), Some("SlowTask"));
+        assert_eq!(tasks[1].cycle_time, Duration::from_millis(10));
+    }
+
+    #[test]
+    fn rejects_invalid_task_name_offsets() {
+        for offset in [None, Some(0), Some(31), Some(65), Some(u32::MAX)] {
+            let mut metadata = entry_type(true);
+            metadata.size = 128;
+            metadata.fields.last_mut().unwrap().offset = offset;
+            assert!(matches!(
+                TaskInfoLayout::from_entry_type(&metadata),
+                Err(Error::TaskInfoLayout(_))
+            ));
+        }
     }
 
     #[test]
