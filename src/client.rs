@@ -657,6 +657,12 @@ pub struct Device<'c> {
 }
 
 impl Device<'_> {
+    /// Return the target address used by this device wrapper.
+    #[must_use]
+    pub fn address(&self) -> AmsAddr {
+        self.addr
+    }
+
     /// Read the device's name + version.
     pub fn get_info(&self) -> Result<DeviceInfo> {
         let mut data = DeviceInfoRaw::new_zeroed();

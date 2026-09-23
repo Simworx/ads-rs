@@ -6,6 +6,13 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// A collection of different errors that can happen with ADS requests.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// The task reader belongs to an obsolete caller-owned metadata generation.
+    #[error("task-info metadata was invalidated; rebuild the reader")]
+    TaskInfoInvalidated,
+    /// The supplied TwinCAT task-info metadata does not describe a supported layout.
+    #[error("unsupported TwinCAT task-info layout: {0}")]
+    TaskInfoLayout(&'static str),
+
     /// An IO error occurred.
     #[error("{0}: {1}")]
     Io(&'static str, std::io::Error),
@@ -35,6 +42,8 @@ impl Clone for Error {
     fn clone(&self) -> Self {
         use Error::*;
         match self {
+            TaskInfoInvalidated => TaskInfoInvalidated,
+            TaskInfoLayout(reason) => TaskInfoLayout(reason),
             Io(ctx, e) => Io(ctx, std::io::Error::from(e.kind())),
             Ads(ctx, e, i) => Ads(ctx, e, *i),
             Reply(ctx, e, i) => Reply(ctx, e, *i),

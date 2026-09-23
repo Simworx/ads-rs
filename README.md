@@ -7,18 +7,51 @@
 This crate allows to connect to [Beckhoff](https://beckhoff.com) TwinCAT devices
 and other servers speaking the ADS (Automation Device Specification) protocol.
 
+## About this fork and upstream contributions
+
+This fork builds on [birkenfeld/ads-rs](https://github.com/birkenfeld/ads-rs).
+We appreciate the original authors' work and the foundation it provides for our
+TwinCAT integration.
+
+The requirements of Simworx's in-house software have taken this fork
+far enough from upstream that we are not currently proposing the full set of
+changes for inclusion. Reviewing, integrating, and maintaining these additions
+would represent a substantial commitment, and that extra scope may not fit the
+upstream maintainers' priorities or available time. This is our decision about
+how to maintain our extensions, rather than a statement that upstream has
+rejected them. Small, independently useful fixes may still be suitable for
+upstream contributions where there is interest.
+
+The fork's additions include:
+
+- More complete TwinCAT symbol and type information, including fields,
+  attributes, enum variants, and RPC metadata.
+- Caller-provided IDs on multi-notification requests, so results can be matched
+  to the application objects that requested them.
+- PLC task information, including task timing and cycle counters, with readers
+  that use the target's type metadata to interpret the layout.
+
+We expect this direction to continue. Planned work includes more PLC and
+EtherCAT diagnostics, further refinements to client sharing and synchronisation
+for our `Send`/`Sync` use cases, and type-safe notification data APIs. These are
+extensions for our integration needs, and further work will be guided by
+experience using the library in Simworx's in-house software.
+
+The badges above and the installation example below refer to the upstream release;
+the fork-specific additions require a suitable revision of this repository.
+
 ## Installation
 
 Use with Cargo as usual, no system dependencies are required.
 
 ```toml
 [dependencies]
-ads = "0.6"
+ads = "0.7"
 ```
 
 ### Rust version
 
-Minimum supported Rust version is 1.71.0.
+Minimum supported Rust version is 1.92.0.
 
 ## Usage
 

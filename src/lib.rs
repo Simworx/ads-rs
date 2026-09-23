@@ -52,6 +52,7 @@ pub mod notif;
 pub mod ports;
 pub mod strings;
 pub mod symbol;
+pub mod task_info;
 #[cfg(test)]
 mod test;
 pub mod udp;
@@ -62,6 +63,10 @@ pub use file::File;
 pub use netid::{AmsAddr, AmsNetId, AmsPort};
 pub use symbol::{
     Attribute, EnumInfo, Handle, RpcMethod, RpcMethodParameter, RpcMethodParameterVariableKind,
+};
+pub use task_info::{
+    PlcTaskInfoSnapshot, PlcTaskSystemInfo, ReportedTaskCount, TaskInfoLayout, TaskInfoLocation,
+    TaskInfoReader,
 };
 
 /// The default port for TCP communication.

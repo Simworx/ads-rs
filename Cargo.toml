@@ -1,13 +1,13 @@
 [package]
 name = "ads"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2018"
-authors = ["Georg Brandl <g.brandl@fz-juelich.de>"]
+authors = ["Georg Brandl <g.brandl@fz-juelich.de>", "Callum Beardsmore <callumbeardsmore@simworx.co.uk>"]
 license = "MIT/Apache-2.0"
 description = "Client for the Beckhoff Automation Device Specification protocol for PLCs"
-repository = "https://github.com/birkenfeld/ads-rs"
+repository = "https://github.com/Simworx/ads-rs"
 keywords = ["Beckhoff", "ADS", "automation", "device", "PLC"]
-rust-version = "1.71"
+rust-version = "1.92"
 
 [dependencies]
 byteorder = "1.5.0"
