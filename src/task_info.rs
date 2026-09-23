@@ -4,9 +4,11 @@
 //! their validated element layout. Construct it while resolving symbols, retain
 //! it for repeated samples, and recreate it when that symbol metadata changes.
 
-use std::convert::TryInto;
 use std::time::Duration;
 
+use byteorder::{ReadBytesExt, LE};
+
+use crate::errors::ErrContext;
 use crate::symbol::Type;
 use crate::{AmsAddr, Device, Error, Result};
 
@@ -94,8 +96,7 @@ impl TaskInfoLayout {
                     let offset = offset as usize;
                     offset >= TASK_PREFIX_SIZE
                         && offset.checked_add(TASK_NAME_SIZE).map_or(false, |end| end <= entry.size)
-                })
-                    && field.size == TASK_NAME_SIZE
+                }) && field.size == TASK_NAME_SIZE
                     && field.base_type == 30
                     && field.array.is_empty() =>
             {
@@ -307,23 +308,30 @@ impl TaskInfoReader {
 fn read_app_task_count(device: Device<'_>, location: TaskInfoLocation) -> Result<u32> {
     let mut bytes = [0; APP_INFO_TASK_COUNT_SIZE];
     device.read_exact(location.index_group, location.index_offset, &mut bytes)?;
-    Ok(u32::from_le_bytes(
-        bytes[APP_INFO_TASK_COUNT_OFFSET..].try_into().expect("four bytes"),
-    ))
+    (&bytes[APP_INFO_TASK_COUNT_OFFSET..])
+        .read_u32::<LE>()
+        .ctx("decoding app task count")
 }
 
 fn decode_task(entry: &[u8], index: i32, task_name_offset: Option<usize>) -> Result<PlcTaskSystemInfo> {
-    if entry.len() < TASK_PREFIX_SIZE {
-        return Err(Error::Reply(
-            "decoding task info",
-            "task entry is shorter than documented prefix",
-            entry.len() as u32,
-        ));
-    }
-    let value_u16 = |offset| u16::from_le_bytes(entry[offset..offset + 2].try_into().expect("field length"));
-    let value_u32 = |offset| u32::from_le_bytes(entry[offset..offset + 4].try_into().expect("field length"));
+    let ctx = "decoding task info";
+    let mut ptr = entry;
+    let object_id = ptr.read_u32::<LE>().ctx(ctx)?;
+    let cycle_time = ptr.read_u32::<LE>().ctx(ctx)?;
+    let priority = ptr.read_u16::<LE>().ctx(ctx)?;
+    let ads_port = ptr.read_u16::<LE>().ctx(ctx)?;
+    let cycle_count = ptr.read_u32::<LE>().ctx(ctx)?;
+    let dc_task_time = ptr.read_i64::<LE>().ctx(ctx)?;
+    let last_exec_time = ptr.read_u32::<LE>().ctx(ctx)?;
+    let first_cycle = ptr.read_u8().ctx(ctx)? != 0;
+    let cycle_time_exceeded = ptr.read_u8().ctx(ctx)? != 0;
+    let in_call_after_output_update = ptr.read_u8().ctx(ctx)? != 0;
+    let rt_violation = ptr.read_u8().ctx(ctx)? != 0;
     let name = if let Some(offset) = task_name_offset {
-        let name_bytes = &entry[offset..offset + TASK_NAME_SIZE];
+        let name_bytes = entry
+            .get(offset..)
+            .and_then(|bytes| bytes.get(..TASK_NAME_SIZE))
+            .ok_or(Error::Io(ctx, std::io::ErrorKind::UnexpectedEof.into()))?;
         let end = name_bytes.iter().position(|byte| *byte == 0).unwrap_or(name_bytes.len());
         Some(String::from_utf8_lossy(&name_bytes[..end]).into_owned())
     } else {
@@ -331,17 +339,17 @@ fn decode_task(entry: &[u8], index: i32, task_name_offset: Option<usize>) -> Res
     };
     Ok(PlcTaskSystemInfo {
         index,
-        object_id: value_u32(0),
-        cycle_time: Duration::from_nanos(u64::from(value_u32(4)) * TICK_NANOS),
-        priority: value_u16(8),
-        ads_port: value_u16(10),
-        cycle_count: value_u32(12),
-        dc_task_time: i64::from_le_bytes(entry[16..24].try_into().expect("field length")),
-        last_exec_time: Duration::from_nanos(u64::from(value_u32(24)) * TICK_NANOS),
-        first_cycle: entry[28] != 0,
-        cycle_time_exceeded: entry[29] != 0,
-        in_call_after_output_update: entry[30] != 0,
-        rt_violation: entry[31] != 0,
+        object_id,
+        cycle_time: Duration::from_nanos(u64::from(cycle_time) * TICK_NANOS),
+        priority,
+        ads_port,
+        cycle_count,
+        dc_task_time,
+        last_exec_time: Duration::from_nanos(u64::from(last_exec_time) * TICK_NANOS),
+        first_cycle,
+        cycle_time_exceeded,
+        in_call_after_output_update,
+        rt_violation,
         name,
     })
 }
@@ -453,8 +461,8 @@ mod tests {
         metadata.size = 128;
         metadata.fields.last_mut().unwrap().offset = Some(64);
         let layout = TaskInfoLayout::from_entry_type(&metadata).expect("PLC layout");
-        let reader = TaskInfoReader::new(AmsAddr::default(), 7, location(256), (1, 2), layout)
-            .expect("reader");
+        let reader =
+            TaskInfoReader::new(AmsAddr::default(), 7, location(256), (1, 2), layout).expect("reader");
         let mut first = entry(128, 10_000);
         first[32..64].fill(0xff); // The gap must not be decoded as a name or task.
         first[64..73].copy_from_slice(b"FastTask\0");
@@ -525,6 +533,30 @@ mod tests {
     #[test]
     fn truncated_data_is_a_reply_error() {
         assert!(matches!(reader(96, true).decode_tasks(&[0; 95]), Err(Error::Reply(..))));
+    }
+
+    #[test]
+    fn truncated_task_fields_return_decode_errors() {
+        let bytes = entry(96, 100_000);
+        for length in 0..TASK_PREFIX_SIZE {
+            assert!(matches!(
+                decode_task(&bytes[..length], 1, None),
+                Err(Error::Io("decoding task info", error))
+                    if error.kind() == std::io::ErrorKind::UnexpectedEof
+            ));
+        }
+        for length in TASK_PREFIX_SIZE..bytes.len() {
+            assert!(matches!(
+                decode_task(&bytes[..length], 1, Some(32)),
+                Err(Error::Io("decoding task info", error))
+                    if error.kind() == std::io::ErrorKind::UnexpectedEof
+            ));
+        }
+        assert!(matches!(
+            decode_task(&bytes, 1, Some(usize::MAX)),
+            Err(Error::Io("decoding task info", error))
+                if error.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
     }
 
     #[test]
