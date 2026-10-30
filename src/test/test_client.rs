@@ -4,7 +4,8 @@ use std::convert::TryFrom;
 use std::io::{Read, Write};
 use std::time::Duration;
 
-use crate::test::{config_test_server, ServerOpts};
+use crate::client::{AdsHeader, Command};
+use crate::test::{config_test_server, frame, scripted_server, ServerOpts};
 use crate::{AmsAddr, AmsNetId, Client, Device, Error, Source, Timeouts};
 
 fn run_test(opts: ServerOpts, f: impl Fn(Device)) {
@@ -353,4 +354,40 @@ fn test_wstring_type() {
         assert!(String::try_from(ret).unwrap() == "abc");
         assert!(<Vec<u16>>::from(ret) == [b'a' as u16, b'b' as u16, b'c' as u16]);
     })
+}
+
+fn run_scripted(reply: impl Fn(&AdsHeader) -> Vec<u8> + Send + 'static, f: impl Fn(Device)) {
+    let port = scripted_server(reply);
+    let timeouts = Timeouts::new(Duration::from_secs(1));
+    let client = Client::new(("127.0.0.1", port), timeouts, Source::Auto).unwrap();
+    f(client.device(AmsAddr::new(AmsNetId::new(1, 2, 3, 4, 5, 6), 851)));
+}
+
+#[test]
+fn test_short_notification_is_skipped() {
+    run_scripted(
+        |request| {
+            let mut state = 0u32.to_le_bytes().to_vec();
+            state.extend([5, 0, 0, 0]);
+            let notif = frame(request, Command::Notification as u16, 4, &[]);
+            [notif, frame(request, request.command.get(), 5, &state)].concat()
+        },
+        |device| assert_eq!(device.get_state().unwrap(), (crate::AdsState::Run, 0)),
+    );
+}
+
+#[test]
+fn test_inconsistent_lengths_fail_pending_request() {
+    run_scripted(
+        |request| {
+            let mut bad = frame(request, request.command.get(), 5, &[0; 8]);
+            bad[26..30].copy_from_slice(&1_000_000u32.to_le_bytes());
+            bad
+        },
+        |device| {
+            let err = device.get_state().unwrap_err();
+            let expected = "AMS/TCP header and AMS header contain inconsistent data";
+            assert!(matches!(err, Error::Reply(_, msg, _) if msg == expected), "{:?}", err);
+        },
+    );
 }

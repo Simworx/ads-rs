@@ -69,6 +69,38 @@ pub fn config_test_server(opts: ServerOpts) -> u16 {
     })
 }
 
+// Builds one AMS/TCP frame from the fake device back to the sender of `request`.
+pub fn frame(request: &AdsHeader, command: u16, state_flags: u16, payload: &[u8]) -> Vec<u8> {
+    let mut header = AdsHeader::new_zeroed();
+    header.length.set(32 + payload.len() as u32);
+    header.dest_netid = request.src_netid;
+    header.dest_port = request.src_port;
+    header.src_netid = request.dest_netid;
+    header.src_port = request.dest_port;
+    header.command.set(command);
+    header.state_flags.set(state_flags);
+    header.data_length.set(payload.len() as u32);
+    header.invoke_id = request.invoke_id;
+    [header.as_bytes(), payload].concat()
+}
+
+// Serves one client: answers its first request with the bytes `reply` returns.
+pub fn scripted_server(reply: impl Fn(&AdsHeader) -> Vec<u8> + Send + 'static) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut header = AdsHeader::new_zeroed();
+        socket.read_exact(header.as_mut_bytes()).unwrap();
+        let mut data = vec![0; header.data_length.get() as usize];
+        socket.read_exact(&mut data).unwrap();
+        socket.write_all(&reply(&header)).unwrap();
+        // hold the connection until the client hangs up
+        let _ = socket.read(&mut [0; 64]);
+    });
+    port
+}
+
 struct Server {
     opts: Arc<Mutex<ServerOpts>>,
     data: Vec<u8>,

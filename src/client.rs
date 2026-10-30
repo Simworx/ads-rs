@@ -533,7 +533,7 @@ impl ClientReceiver {
     }
 
     fn reader_work(
-        source: AmsAddr, pending: PendingMap, socket_rx: &mut TcpStream,
+        source: AmsAddr, pending: PendingMap, socket_rx: &mut impl Read,
         notif_tx: &mut Sender<notif::Notification>,
     ) -> Result<()> {
         loop {
@@ -565,9 +565,25 @@ impl ClientReceiver {
 
             let payload_len = ads_header.data_length.get();
 
-            let mut payload_buf = vec![0u8; payload_len as usize];
+            // If the header length fields aren't self-consistent, abort the connection.
+            if payload_len != packet_len - AMS_HEADER_SIZE as u32 {
+                return Err(Error::Reply(
+                    "interpreting received AMS packet",
+                    "AMS/TCP header and AMS header contain inconsistent data",
+                    0,
+                ));
+            }
 
-            socket_rx.read_exact(&mut payload_buf).ctx("receiving Ads data payload")?;
+            // grows with the data so a bogus length cannot force a huge allocation
+            let mut payload_buf = Vec::new();
+            socket_rx
+                .by_ref()
+                .take(payload_len.into())
+                .read_to_end(&mut payload_buf)
+                .ctx("receiving Ads data payload")?;
+            if payload_buf.len() != payload_len as usize {
+                return Err(std::io::ErrorKind::UnexpectedEof.into()).ctx("receiving Ads data payload");
+            }
 
             // Reserved bytes should be well-known
             // Anything else might be invalid data
@@ -581,15 +597,6 @@ impl ClientReceiver {
                         unknown as _,
                     ))
                 }
-            }
-
-            // If the header length fields aren't self-consistent, abort the connection.
-            if payload_len != packet_len - AMS_HEADER_SIZE as u32 {
-                return Err(Error::Reply(
-                    "interpreting received AMS packet",
-                    "AMS/TCP header and AMS header contain inconsistent data",
-                    0,
-                ));
             }
 
             // Check that the packet is meant for us.
@@ -622,7 +629,10 @@ impl ClientReceiver {
                     }
                 };
             } else {
-                let notif_payload_len = LE::read_u32(&payload_buf);
+                let Some(len_bytes) = payload_buf.get(..4) else {
+                    continue;
+                };
+                let notif_payload_len = LE::read_u32(len_bytes);
                 if ads_header.state_flags != 4
                     || ads_header.error_code != 0
                     || notif_payload_len != payload_len - 4
