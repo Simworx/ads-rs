@@ -91,16 +91,19 @@ impl Message {
             return Err(Error::Reply("parsing UDP packet", "invalid service ID", rep_service));
         }
         let _src = AmsAddr::read_from(&mut data_ptr).ctx("parsing UDP packet")?;
-        let nitems = data_ptr.read_u32::<LE>().ctx("parsing UDP packet")?;
+        let _nitems = data_ptr.read_u32::<LE>().ctx("parsing UDP packet")?;
 
-        let mut items = Vec::with_capacity(nitems as usize);
+        let mut items = Vec::new();
         {
             let mut pos = 28;
             while let Ok(tag) = data_ptr.read_u16::<LE>() {
                 let len = data_ptr.read_u16::<LE>().ctx("parsing UDP packet")? as usize;
+                let Some(rest) = data_ptr.get(len..) else {
+                    return Err(Error::Reply("parsing UDP packet", "item longer than packet", len as u32));
+                };
                 items.push((tag, pos, pos + len));
                 pos += len + 4;
-                data_ptr = &data_ptr[len..];
+                data_ptr = rest;
             }
         }
         Ok(Self { data: data.to_vec(), items })
@@ -156,7 +159,7 @@ impl Message {
     /// Get the data for given tag as null-terminated string.
     pub fn get_str(&self, tag: Tag) -> Option<&str> {
         // exclude the null terminator
-        self.map_tag(tag, |b| str::from_utf8(&b[..b.len() - 1]).ok())
+        self.map_tag(tag, |b| b.split_last().and_then(|(_, s)| str::from_utf8(s).ok()))
     }
 
     /// Get the data for given tag as a u32.

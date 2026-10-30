@@ -50,3 +50,40 @@ fn test_udp() {
     udp::add_route(("127.0.0.1", port), tgt_netid, "a", Some("route"), None, None, false).unwrap();
     assert!(udp::add_route(("127.0.0.1", port), tgt_netid, "a", None, None, None, false).is_err());
 }
+
+fn identify_reply() -> Vec<u8> {
+    let mut msg = udp::Message::new(udp::ServiceId::Identify, crate::AmsAddr::default());
+    msg.set_service(udp::ServiceId::Identify, true);
+    msg.as_bytes().to_vec()
+}
+
+#[test]
+fn test_parse_rejects_item_longer_than_packet() {
+    let mut packet = identify_reply();
+    packet.extend([1, 0, 0xFF, 0]);
+    let Err(err) = udp::Message::parse(&packet, udp::ServiceId::Identify, true) else {
+        panic!("parsed a packet with a truncated item");
+    };
+    assert!(
+        matches!(err, crate::Error::Reply(_, "item longer than packet", 255)),
+        "{:?}",
+        err
+    );
+}
+
+#[test]
+fn test_get_str_of_empty_item_is_none() {
+    let mut packet = identify_reply();
+    packet.extend([5, 0, 0, 0]);
+    let Ok(msg) = udp::Message::parse(&packet, udp::ServiceId::Identify, true) else {
+        panic!("empty item rejected");
+    };
+    assert_eq!(msg.get_str(udp::Tag::ComputerName), None);
+}
+
+#[test]
+fn test_parse_does_not_trust_item_count() {
+    let mut packet = identify_reply();
+    packet[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(udp::Message::parse(&packet, udp::ServiceId::Identify, true).is_ok());
+}
