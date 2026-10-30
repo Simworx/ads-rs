@@ -620,3 +620,36 @@ fn test_drop_survives_poisoned_socket_lock() {
     assert!(dropped.is_ok(), "drop panicked");
     assert!(start.elapsed() < Duration::from_secs(1), "drop took {:?}", start.elapsed());
 }
+
+#[test]
+fn test_failed_write_discards_pending_and_stops_later_requests() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (drain_tx, drain_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        drain_rx.recv().unwrap();
+        let _ = socket.read_to_end(&mut Vec::new());
+    });
+
+    let client = Client::new(addr, Timeouts::new(Duration::from_millis(100)), Source::Auto).unwrap();
+    let device = client.device(AmsAddr::new(AmsNetId::new(1, 2, 3, 4, 5, 6), 851));
+
+    // Bigger than the loopback socket buffers so the write stops part way through the frame
+    let err = device.write(0, 0, &vec![0; 64 << 20]).unwrap_err();
+    assert!(matches!(err, Error::Timeout(_)), "{:?}", err);
+    assert!(client.pending.lock().unwrap().is_empty());
+
+    // The peer reads again so a retry on the old code would go out behind the partial frame
+    drain_tx.send(()).unwrap();
+    let err = device.get_state().unwrap_err();
+    assert!(
+        matches!(&err, Error::Io(_, io) if io.kind() == std::io::ErrorKind::BrokenPipe),
+        "{:?}",
+        err
+    );
+    assert!(client.pending.lock().unwrap().is_empty());
+
+    drop(client);
+    server.join().unwrap();
+}

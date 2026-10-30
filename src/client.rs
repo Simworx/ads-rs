@@ -132,7 +132,7 @@ pub struct Client {
     /// The AMS address of the client
     source: AmsAddr,
     /// Active requests
-    pending: PendingMap,
+    pub(crate) pending: PendingMap,
     /// Receiver for notifications: cloned and given out to interested parties
     notif_recv: Receiver<notif::Notification>,
     /// Active notification handles: these will be closed on Drop
@@ -370,11 +370,19 @@ impl Client {
 
         self.insert_pending_request(dispatched_invoke_id, resp_tx);
 
-        self.socket
-            .lock()
-            .expect("panicked during socket write")
-            .write_all(&request_buf)
-            .ctx("dispatching assembled command payload")?;
+        let written = {
+            let mut socket = self.socket.lock().expect("panicked during socket write");
+            let written = socket.write_all(&request_buf);
+            if written.is_err() {
+                // part of the frame may be out so a later request would land in the middle of it
+                let _ = socket.shutdown(Shutdown::Both);
+            }
+            written
+        };
+        if written.is_err() {
+            self.discard_pending_request(&dispatched_invoke_id);
+        }
+        written.ctx("dispatching assembled command payload")?;
 
         let (resp_header, resp_buf) = match self.read_timeout {
             Some(timeout) => match resp_rx.recv_timeout(timeout) {
