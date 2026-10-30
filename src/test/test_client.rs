@@ -591,3 +591,32 @@ fn test_drop_does_not_wait_for_silent_server() {
     drop(client);
     assert!(start.elapsed() < Duration::from_secs(1), "drop took {:?}", start.elapsed());
 }
+
+#[test]
+fn test_drop_survives_poisoned_socket_lock() {
+    use crate::notif::{Attributes, TransmissionMode};
+    use std::time::Instant;
+    let port = config_test_server(ServerOpts::default());
+    let client =
+        Client::new(("127.0.0.1", port), Timeouts::new(Duration::from_secs(2)), Source::Auto).unwrap();
+    let device = client.device(AmsAddr::new(AmsNetId::new(1, 2, 3, 4, 5, 6), 851));
+    let attrib = Attributes::new(
+        4,
+        TransmissionMode::ServerOnChange,
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+    );
+    device.add_notification(0x4020, 0, &attrib).unwrap();
+    let joined = std::thread::scope(|s| {
+        s.spawn(|| {
+            let _guard = client.socket.lock().unwrap();
+            panic!("poisoning the socket lock");
+        })
+        .join()
+    });
+    assert!(joined.is_err() && client.socket.is_poisoned());
+    let start = Instant::now();
+    let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(client)));
+    assert!(dropped.is_ok(), "drop panicked");
+    assert!(start.elapsed() < Duration::from_secs(1), "drop took {:?}", start.elapsed());
+}

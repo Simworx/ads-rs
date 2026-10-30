@@ -123,7 +123,7 @@ pub enum Source {
 #[derive(Debug)]
 pub struct Client {
     /// TCP connection (duplicated with the reader)
-    socket: Mutex<TcpStream>,
+    pub(crate) socket: Mutex<TcpStream>,
     /// Current invoke ID (identifies the request/reply pair), incremented
     /// after each request
     invoke_id: AtomicU32,
@@ -154,7 +154,13 @@ impl Drop for Client {
 
         // Close open notification handles and give up once the PLC stops answering.
         let handles = std::mem::take(self.notif_handles.get_mut().unwrap_or_else(PoisonError::into_inner));
+        // a request takes these locks with expect and a panic in Drop can abort
+        let poisoned =
+            self.socket.is_poisoned() || self.notif_handles.is_poisoned() || self.pending.is_poisoned();
         for (addr, handle) in handles {
+            if poisoned {
+                break;
+            }
             if let Err(Error::Timeout(_) | Error::Io(..) | Error::IoSync(..)) =
                 self.device(addr).delete_notification(handle)
             {
