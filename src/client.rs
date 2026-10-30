@@ -100,6 +100,9 @@ impl Timeouts {
     }
 }
 
+// Deadline for each request Drop sends so a dead PLC cannot hold up the drop.
+const DROP_TIMEOUT: Duration = Duration::from_millis(250);
+
 /// Specifies the source AMS address to use.
 #[derive(Clone, Copy, Debug)]
 pub enum Source {
@@ -142,30 +145,34 @@ pub struct Client {
 
 impl Drop for Client {
     fn drop(&mut self) {
-        // the notif_handles lock should only be poisioned in panics coming
-        // from std code, so a panic is probably acceptable here.
-        let handles = self
-            .notif_handles
+        self.read_timeout = Some(self.read_timeout.map_or(DROP_TIMEOUT, |t| t.min(DROP_TIMEOUT)));
+        let _ = self
+            .socket
             .get_mut()
-            .expect("notification handle cache lock was poisoned");
+            .unwrap_or_else(PoisonError::into_inner)
+            .set_write_timeout(Some(DROP_TIMEOUT));
 
-        // Close all open notification handles.
-        for (addr, handle) in std::mem::take(handles) {
-            let _ = self.device(addr).delete_notification(handle);
-        }
-
-        if let Ok(ref mut socket) = self.socket.lock() {
-            // Remove our port from the router, if necessary.
-            if self.source_port_opened {
-                let mut close_port_msg = [1, 0, 2, 0, 0, 0, 0, 0];
-                LE::write_u16(&mut close_port_msg[6..], self.source.port());
-                let _ = socket.write_all(&close_port_msg);
+        // Close open notification handles and give up once the PLC stops answering.
+        let handles = std::mem::take(self.notif_handles.get_mut().unwrap_or_else(PoisonError::into_inner));
+        for (addr, handle) in handles {
+            if let Err(Error::Timeout(_) | Error::Io(..) | Error::IoSync(..)) =
+                self.device(addr).delete_notification(handle)
+            {
+                break;
             }
-
-            let _ = socket.shutdown(Shutdown::Both);
         }
 
-        self.receiver.stop();
+        let socket = self.socket.get_mut().unwrap_or_else(PoisonError::into_inner);
+        // Remove our port from the router, if necessary.
+        if self.source_port_opened {
+            let mut close_port_msg = [1, 0, 2, 0, 0, 0, 0, 0];
+            LE::write_u16(&mut close_port_msg[6..], self.source.port());
+            let _ = socket.write_all(&close_port_msg);
+        }
+        let _ = socket.shutdown(Shutdown::Both);
+
+        // the shutdown wakes the reader so it is detached rather than joined
+        drop(self.receiver.handle.take());
     }
 }
 
@@ -538,10 +545,6 @@ impl ClientReceiver {
         let _ = self.handle.insert(rx_worker);
     }
 
-    fn stop(&mut self) -> Option<Result<()>> {
-        self.handle.take()?.join().ok()
-    }
-
     fn reader_work(
         source: AmsAddr, pending: PendingMap, socket_rx: &mut impl Read,
         notif_tx: &mut Sender<notif::Notification>,
@@ -662,12 +665,6 @@ impl ClientReceiver {
                 }
             }
         }
-    }
-}
-
-impl Drop for ClientReceiver {
-    fn drop(&mut self) {
-        self.stop();
     }
 }
 
@@ -1019,7 +1016,8 @@ impl Device<'_> {
     /// The returned `Handle` can be used to check which notification has fired.
     ///
     /// If the notification is not deleted explictly using `delete_notification`
-    /// and the `Handle`, it is deleted when the `Client` object is dropped.
+    /// and the `Handle`, dropping the `Client` deletes it on a best effort basis
+    /// with a 250 ms deadline per handle.
     pub fn add_notification(
         &self, index_group: u32, index_offset: u32, attributes: &notif::Attributes,
     ) -> Result<notif::Handle> {

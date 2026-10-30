@@ -571,3 +571,23 @@ fn test_idle_client_outlives_its_read_timeout() {
     std::thread::sleep(Duration::from_millis(200));
     device.get_state().expect("a request after an idle period still works");
 }
+
+#[test]
+fn test_drop_does_not_wait_for_silent_server() {
+    use crate::notif::{Attributes, TransmissionMode};
+    use std::time::Instant;
+    let port = config_test_server(ServerOpts { silent_after: Some(1), ..Default::default() });
+    let timeouts = Timeouts::new(Duration::from_secs(2));
+    let client = Client::new(("127.0.0.1", port), timeouts, Source::Auto).unwrap();
+    let device = client.device(AmsAddr::new(AmsNetId::new(1, 2, 3, 4, 5, 6), 851));
+    let attrib = Attributes::new(
+        4,
+        TransmissionMode::ServerOnChange,
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+    );
+    device.add_notification(0x4020, 0, &attrib).unwrap();
+    let start = Instant::now();
+    drop(client);
+    assert!(start.elapsed() < Duration::from_secs(1), "drop took {:?}", start.elapsed());
+}

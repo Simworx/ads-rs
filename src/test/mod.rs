@@ -60,6 +60,7 @@ pub struct ServerOpts {
     pub garbage_header: bool,
     pub bad_notif: bool,
     pub ignore_invokeid: bool,
+    pub silent_after: Option<usize>,
 }
 
 pub fn config_test_server(opts: ServerOpts) -> u16 {
@@ -119,6 +120,7 @@ struct Server {
 impl Server {
     fn handle_client(&mut self, mut socket: TcpStream) {
         let opts = self.opts.clone();
+        let mut answered = 0;
         loop {
             let opts = opts.lock().unwrap();
             let mut header = AdsHeader::new_zeroed();
@@ -145,6 +147,10 @@ impl Server {
             if opts.no_reply {
                 return;
             }
+            if opts.silent_after.is_some_and(|n| answered >= n) {
+                continue;
+            }
+            answered += 1;
 
             let (reply_data, error) = match header.command.get() {
                 1 => self.do_devinfo(&data),
