@@ -380,8 +380,7 @@ impl Client {
 
                 Err(RecvTimeoutError::Timeout) => {
                     self.discard_pending_request(&dispatched_invoke_id);
-                    return Err(std::io::ErrorKind::TimedOut.into())
-                        .ctx("waiting for response to dispatched request");
+                    return Err(Error::Timeout("waiting for response to dispatched request"));
                 }
             },
 

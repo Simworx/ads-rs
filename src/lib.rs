@@ -58,7 +58,7 @@ mod test;
 pub mod udp;
 
 pub use client::{AdsState, Client, Device, Source, Timeouts};
-pub use errors::{Error, Result};
+pub use errors::{AdsErrorCode, Error, Result};
 pub use file::File;
 pub use netid::{AmsAddr, AmsNetId, AmsPort};
 pub use symbol::{

@@ -29,26 +29,8 @@ fn test_timeout() {
     run_test(
         ServerOpts { timeout: Some(Duration::from_millis(1)), ..Default::default() },
         |device| {
-            use std::io::ErrorKind;
             let err = device.get_info().unwrap_err();
-
-            // darwin (maybe other BSDs too?) kernel seems to return `WouldBlock` on timeout
-            // linux/windows align on returning `TimedOut`, which makes more sense semantically
-            let expected_err = {
-                #[cfg(target_os = "macos")]
-                {
-                    ErrorKind::WouldBlock
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    ErrorKind::TimedOut
-                }
-            };
-
-            match err {
-                Error::Io(_, err) if err.kind() == expected_err => (),
-                _ => panic!("unexpected error from timeout: {}", err),
-            }
+            assert!(matches!(err, Error::Timeout(_)), "unexpected error from timeout: {}", err);
         },
     )
 }

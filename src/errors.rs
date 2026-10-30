@@ -17,6 +17,10 @@ pub enum Error {
     #[error("{0}: {1}")]
     Io(&'static str, std::io::Error),
 
+    /// No reply arrived within the configured timeout.
+    #[error("{0}: timed out")]
+    Timeout(&'static str),
+
     /// The ADS server responded with an error code.
     #[error("{0}: {1} ({2:#x})")]
     Ads(&'static str, &'static str, u32),
@@ -44,13 +48,81 @@ impl Clone for Error {
         match self {
             TaskInfoInvalidated => TaskInfoInvalidated,
             TaskInfoLayout(reason) => TaskInfoLayout(reason),
-            Io(ctx, e) => Io(ctx, std::io::Error::from(e.kind())),
+            Io(ctx, e) => Io(ctx, std::io::Error::new(e.kind(), e.to_string())),
+            Timeout(ctx) => Timeout(ctx),
             Ads(ctx, e, i) => Ads(ctx, e, *i),
             Reply(ctx, e, i) => Reply(ctx, e, *i),
             Overflow(e) => Overflow(*e),
             IoSync(ctx, e, i) => IoSync(ctx, e, *i),
             Other(ctx) => Other(ctx),
         }
+    }
+}
+
+impl Error {
+    /// The ADS result code if this is an [`Error::Ads`].
+    pub fn ads_code(&self) -> Option<AdsErrorCode> {
+        match self {
+            Error::Ads(_, _, code) => Some(AdsErrorCode(*code)),
+            _ => None,
+        }
+    }
+}
+
+/// A typed ADS result code as carried by [`Error::Ads`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AdsErrorCode(pub u32);
+
+impl AdsErrorCode {
+    /// Target port not found, possibly ADS server not started.
+    pub const TARGET_PORT_NOT_FOUND: Self = Self(0x006);
+    /// Target machine not found, possibly missing ADS routes.
+    pub const TARGET_MACHINE_NOT_FOUND: Self = Self(0x007);
+    /// Service is not supported by server.
+    pub const SERVICE_NOT_SUPPORTED: Self = Self(0x701);
+    /// Invalid index group.
+    pub const INVALID_INDEX_GROUP: Self = Self(0x702);
+    /// Invalid index offset.
+    pub const INVALID_INDEX_OFFSET: Self = Self(0x703);
+    /// Parameter size not correct.
+    pub const INVALID_SIZE: Self = Self(0x705);
+    /// Device is not in a ready state.
+    pub const DEVICE_NOT_READY: Self = Self(0x707);
+    /// Device is busy.
+    pub const DEVICE_BUSY: Self = Self(0x708);
+    /// Symbol not found.
+    pub const SYMBOL_NOT_FOUND: Self = Self(0x710);
+    /// Symbol version invalid, a new handle is needed.
+    pub const SYMBOL_VERSION_INVALID: Self = Self(0x711);
+    /// Notification handle is invalid.
+    pub const INVALID_NOTIFICATION_HANDLE: Self = Self(0x714);
+    /// Timeout elapsed in the ADS client of the router.
+    pub const CLIENT_TIMEOUT: Self = Self(0x745);
+
+    /// The Beckhoff description of this code.
+    pub fn description(self) -> &'static str {
+        match ADS_ERRORS.binary_search_by_key(&self.0, |e| e.0) {
+            Ok(idx) => ADS_ERRORS[idx].1,
+            Err(_) => "Unknown error code",
+        }
+    }
+}
+
+impl From<u32> for AdsErrorCode {
+    fn from(code: u32) -> Self {
+        Self(code)
+    }
+}
+
+impl From<AdsErrorCode> for u32 {
+    fn from(code: AdsErrorCode) -> Self {
+        code.0
+    }
+}
+
+impl std::fmt::Display for AdsErrorCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({:#x})", self.description(), self.0)
     }
 }
 
@@ -62,7 +134,11 @@ pub(crate) trait ErrContext {
 impl<T> ErrContext for std::result::Result<T, std::io::Error> {
     type Success = T;
     fn ctx(self, context: &'static str) -> Result<Self::Success> {
-        self.map_err(|e| Error::Io(context, e))
+        self.map_err(|e| match e.kind() {
+            // unix reports an expired SO_RCVTIMEO on a blocking socket as WouldBlock
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => Error::Timeout(context),
+            _ => Error::Io(context, e),
+        })
     }
 }
 
@@ -207,8 +283,5 @@ pub const ADS_ERRORS: &[(u32, &str)] = &[
 
 /// Return an `Error` corresponding to the given ADS result code.
 pub fn ads_error<T>(action: &'static str, err: u32) -> Result<T> {
-    match ADS_ERRORS.binary_search_by_key(&err, |e| e.0) {
-        Ok(idx) => Err(Error::Ads(action, ADS_ERRORS[idx].1, err)),
-        Err(_) => Err(Error::Ads(action, "Unknown error code", err)),
-    }
+    Err(Error::Ads(action, AdsErrorCode(err).description(), err))
 }
