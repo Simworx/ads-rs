@@ -707,7 +707,7 @@ impl Device<'_> {
 
         let mut read_len = U32::new(0);
 
-        self.client.communicate(
+        let got = self.client.communicate(
             Command::Read,
             self.addr,
             &[header.as_bytes()],
@@ -718,6 +718,7 @@ impl Device<'_> {
         if len as usize > data.len() {
             return Err(Error::Reply("read data", "returned length exceeds buffer", len));
         }
+        check_reply_len("read data", got, len, 0)?;
         Ok(len as usize)
     }
 
@@ -803,9 +804,16 @@ impl Device<'_> {
             r_buffers[1 + i] = req.res.as_mut_bytes();
             r_buffers[1 + nreq + i] = req.rbuf;
         }
-        self.client
+        let got = self
+            .client
             .communicate(Command::ReadWrite, self.addr, &w_buffers, &mut r_buffers)?;
-        Ok(())
+        let data_len = returned_data_len(requests.iter().map(|r| (&r.res, r.rbuf.len())));
+        check_reply_len(
+            "multi-read data",
+            got,
+            read_len.get(),
+            size_of::<ResultLength>() * nreq + data_len,
+        )
     }
 
     /// Write some data to a given index group/offset.
@@ -878,9 +886,10 @@ impl Device<'_> {
             w_buffers[1 + nreq + i] = req.wbuf;
             r_buffers.push(req.res.as_mut_bytes());
         }
-        self.client
+        let got = self
+            .client
             .communicate(Command::ReadWrite, self.addr, &w_buffers, &mut r_buffers)?;
-        Ok(())
+        check_reply_len("multi-write data", got, read_len.get(), rlen)
     }
 
     /// Write some data to a given index group/offset and then read back some
@@ -896,7 +905,7 @@ impl Device<'_> {
             write_length: U32::new(write_data.len().try_into()?),
         };
         let mut read_len = U32::new(0);
-        self.client.communicate(
+        let got = self.client.communicate(
             Command::ReadWrite,
             self.addr,
             &[header.as_bytes(), write_data],
@@ -906,6 +915,7 @@ impl Device<'_> {
         if len as usize > read_data.len() {
             return Err(Error::Reply("write/read data", "returned length exceeds buffer", len));
         }
+        check_reply_len("write/read data", got, len, 0)?;
         Ok(len as usize)
     }
 
@@ -954,8 +964,16 @@ impl Device<'_> {
             r_buffers[1 + nreq + i] = req.rbuf;
         }
 
-        self.client
+        let got = self
+            .client
             .communicate(Command::ReadWrite, self.addr, &w_buffers, &mut r_buffers)?;
+        let data_len = returned_data_len(requests.iter().map(|r| (&r.res, r.rbuf.len())));
+        check_reply_len(
+            "multi-read/write data",
+            got,
+            read_len.get(),
+            size_of::<ResultLength>() * nreq + data_len,
+        )?;
 
         // unfortunately SUMUP_READWRITE returns only the actual read bytes for each
         // request, so if there are short reads the buffers got filled wrongly
@@ -1049,8 +1067,10 @@ impl Device<'_> {
             r_buffers.push(req.res.as_mut_bytes());
         }
 
-        self.client
+        let got = self
+            .client
             .communicate(Command::ReadWrite, self.addr, &w_buffers, &mut r_buffers)?;
+        check_reply_len("multi-add notification", got, read_len.get(), rlen)?;
 
         for req in requests {
             if let Ok(handle) = req.handle() {
@@ -1107,8 +1127,10 @@ impl Device<'_> {
             r_buffers.push(req.res.as_mut_bytes());
         }
 
-        self.client
+        let got = self
+            .client
             .communicate(Command::ReadWrite, self.addr, &w_buffers, &mut r_buffers)?;
+        check_reply_len("multi-delete notification", got, read_len.get(), rlen)?;
 
         for req in requests {
             if req.ensure().is_ok() {
@@ -1524,6 +1546,25 @@ impl DelNotifRequest {
             Ok(())
         }
     }
+}
+
+// `got` is what `communicate` returns and so includes the 4 bytes of the claimed length field itself.
+fn check_reply_len(ctx: &'static str, got: usize, claimed: u32, needed: usize) -> Result<()> {
+    if (claimed as usize) < needed {
+        return Err(Error::Reply(ctx, "claimed less data than expected", claimed));
+    }
+    if got.saturating_sub(size_of::<u32>()) < claimed as usize {
+        return Err(Error::Reply(ctx, "got less data than expected", got as u32));
+    }
+    Ok(())
+}
+
+// Failed requests send no data and a length beyond the buffer is reported per request by `data`.
+fn returned_data_len<'a>(results: impl Iterator<Item = (&'a ResultLength, usize)>) -> usize {
+    results
+        .filter(|(res, buf_len)| res.result.get() == 0 && res.length.get() as usize <= *buf_len)
+        .map(|(res, _)| res.length.get() as usize)
+        .sum()
 }
 
 fn fixup_write_read_return_buffers(requests: &mut [WriteReadRequest]) -> Result<()> {

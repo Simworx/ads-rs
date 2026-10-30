@@ -4,7 +4,9 @@ use std::convert::TryFrom;
 use std::io::{Read, Write};
 use std::time::Duration;
 
-use crate::client::{AdsHeader, Command};
+use crate::client::{
+    AddNotifRequest, AdsHeader, Command, DelNotifRequest, ReadRequest, WriteReadRequest, WriteRequest,
+};
 use crate::test::{config_test_server, frame, scripted_server, ServerOpts};
 use crate::{AmsAddr, AmsNetId, Client, Device, Error, Source, Timeouts};
 
@@ -456,4 +458,122 @@ fn test_samples_of_many_empty_stamps_do_not_overflow_the_stack() {
         .join()
         .unwrap();
     assert_eq!(count, 0);
+}
+
+fn run_with_payload(words: &'static [u32], data: &'static [u8], f: impl Fn(Device)) {
+    run_scripted(
+        move |request| {
+            let mut payload = 0u32.to_le_bytes().to_vec();
+            words.iter().for_each(|word| payload.extend_from_slice(&word.to_le_bytes()));
+            payload.extend_from_slice(data);
+            frame(request, request.command.get(), 5, &payload)
+        },
+        f,
+    );
+}
+
+fn assert_short(result: crate::Result<impl std::fmt::Debug>) {
+    let err = result.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::Reply(_, "got less data than expected" | "claimed less data than expected", _)
+        ),
+        "{:?}",
+        err
+    );
+}
+
+#[test]
+fn test_read_claiming_more_than_received_is_an_error() {
+    run_with_payload(&[4], &[], |device| {
+        assert_short(device.read(0, 0, &mut [0xAA; 4]));
+        assert_short(device.read_exact(0, 0, &mut [0xAA; 4]));
+        assert_short(device.read_value::<u32>(0, 0));
+        assert_short(device.write_read(0, 0, &[], &mut [0xAA; 4]));
+        assert_short(device.write_read_exact(0, 0, &[], &mut [0xAA; 4]));
+    });
+}
+
+#[test]
+fn test_read_into_larger_buffer_returns_the_count() {
+    run_with_payload(&[2], &[1, 2], |device| {
+        let mut buf = [0xAA; 8];
+        assert_eq!(device.read(0, 0, &mut buf).unwrap(), 2);
+        assert_eq!(buf[..2], [1, 2]);
+        assert_eq!(device.write_read(0, 0, &[], &mut buf).unwrap(), 2);
+        assert_short(device.read_exact(0, 0, &mut buf));
+    });
+}
+
+fn assert_all_multis_short(device: Device) {
+    let attrs = crate::notif::Attributes::new(
+        4,
+        crate::notif::TransmissionMode::ServerOnChange,
+        Duration::ZERO,
+        Duration::ZERO,
+    );
+    let mut buf = [0xAA; 4];
+    assert_short(device.write_multi(&mut [WriteRequest::new(0, 0, &[1])]));
+    assert_short(device.read_multi(&mut [ReadRequest::new(0, 0, &mut buf)]));
+    assert_short(device.write_read_multi(&mut [WriteReadRequest::new(0, 0, &[], &mut buf)]));
+    assert_short(device.add_notification_multi(&mut [AddNotifRequest::new(0, 0, &attrs)]));
+    assert_short(device.delete_notification_multi(&mut [DelNotifRequest::new(1)]));
+}
+
+#[test]
+fn test_multi_claiming_no_results_is_an_error() {
+    run_with_payload(&[0], &[], assert_all_multis_short);
+}
+
+#[test]
+fn test_multi_claiming_results_it_did_not_send_is_an_error() {
+    run_with_payload(&[8], &[], assert_all_multis_short);
+}
+
+#[test]
+fn test_multi_result_length_without_its_data_is_an_error() {
+    run_with_payload(&[8, 0, 4], &[], |device| {
+        let mut buf = [0xAA; 4];
+        assert_short(device.read_multi(&mut [ReadRequest::new(0, 0, &mut buf)]));
+        assert_short(device.write_read_multi(&mut [WriteReadRequest::new(0, 0, &[], &mut buf)]));
+    });
+}
+
+#[test]
+fn test_multi_short_read_returns_the_short_data() {
+    run_with_payload(&[10, 0, 2], &[1, 2], |device| {
+        let mut buf = [0xAA; 4];
+        let mut requests = [ReadRequest::new(0, 0, &mut buf)];
+        device.read_multi(&mut requests).unwrap();
+        assert_eq!(requests[0].data().unwrap(), [1, 2]);
+
+        let mut buf = [0xAA; 4];
+        let mut requests = [WriteReadRequest::new(0, 0, &[], &mut buf)];
+        device.write_read_multi(&mut requests).unwrap();
+        assert_eq!(requests[0].data().unwrap(), [1, 2]);
+    });
+}
+
+#[test]
+fn test_multi_failed_request_needs_no_data() {
+    run_with_payload(&[8, 0x710, 4], &[], |device| {
+        let mut buf = [0xAA; 4];
+        let mut requests = [ReadRequest::new(0, 0, &mut buf)];
+        device.read_multi(&mut requests).unwrap();
+        assert!(matches!(requests[0].data(), Err(Error::Ads(_, _, 0x710))));
+    });
+}
+
+#[test]
+fn test_multi_length_beyond_buffer_stays_a_per_request_error() {
+    run_with_payload(&[8, 0, 100], &[], |device| {
+        let mut buf = [0xAA; 4];
+        let mut requests = [ReadRequest::new(0, 0, &mut buf)];
+        device.read_multi(&mut requests).unwrap();
+        assert!(matches!(
+            requests[0].data(),
+            Err(Error::Reply(_, "returned length exceeds buffer", 100))
+        ));
+    });
 }

@@ -84,19 +84,22 @@ pub fn frame(request: &AdsHeader, command: u16, state_flags: u16, payload: &[u8]
     [header.as_bytes(), payload].concat()
 }
 
-// Serves one client: answers its first request with the bytes `reply` returns.
+// Serves one client: answers each request with the bytes `reply` returns.
 pub fn scripted_server(reply: impl Fn(&AdsHeader) -> Vec<u8> + Send + 'static) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     thread::spawn(move || {
         let (mut socket, _) = listener.accept().unwrap();
-        let mut header = AdsHeader::new_zeroed();
-        socket.read_exact(header.as_mut_bytes()).unwrap();
-        let mut data = vec![0; header.data_length.get() as usize];
-        socket.read_exact(&mut data).unwrap();
-        socket.write_all(&reply(&header)).unwrap();
-        // hold the connection until the client hangs up
-        let _ = socket.read(&mut [0; 64]);
+        // answers every request until the client hangs up
+        loop {
+            let mut header = AdsHeader::new_zeroed();
+            if socket.read_exact(header.as_mut_bytes()).is_err() {
+                return;
+            }
+            let mut data = vec![0; header.data_length.get() as usize];
+            socket.read_exact(&mut data).unwrap();
+            socket.write_all(&reply(&header)).unwrap();
+        }
     });
     port
 }
