@@ -391,3 +391,33 @@ fn test_inconsistent_lengths_fail_pending_request() {
         },
     );
 }
+
+#[test]
+fn test_short_reply_is_an_error() {
+    run_scripted(
+        |request| frame(request, request.command.get(), 5, &[]),
+        |device| {
+            let err = device.get_state().unwrap_err();
+            let expected = "reply shorter than its result field";
+            assert!(matches!(err, Error::Reply(_, msg, 0) if msg == expected), "{:?}", err);
+        },
+    );
+}
+
+#[test]
+fn test_write_read_length_beyond_buffer() {
+    run_scripted(
+        |request| {
+            let payload = [0u32.to_le_bytes(), 100u32.to_le_bytes(), [0; 4]].concat();
+            frame(request, request.command.get(), 5, &payload)
+        },
+        |device| {
+            let err = device.write_read(0, 0, &[], &mut [0; 4]).unwrap_err();
+            assert!(
+                matches!(err, Error::Reply(_, "returned length exceeds buffer", 100)),
+                "{:?}",
+                err
+            );
+        },
+    );
+}

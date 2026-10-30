@@ -311,6 +311,9 @@ const RPC_PARAM_ATTRIBUTE_FLAG: u32 = 0x40;
 /// response, so we reject it rather than attempt to decode it.
 const MAX_STR_LEN: usize = 8196;
 
+// Bounds the buffers get_symbol_info allocates from the server's claimed upload lengths
+const MAX_UPLOAD: usize = 64 * 1024 * 1024;
+
 /// Read a length-prefixed, null-terminated string: `len` content bytes followed
 /// by a terminating null byte.
 ///
@@ -643,6 +646,11 @@ pub fn get_symbol_info(device: Device<'_>) -> Result<(Vec<Symbol>, TypeMap)> {
     device.read_exact(index::SYM_UPLOAD_INFO2, 0, &mut read_data)?;
     let symbol_len = LE::read_u32(&read_data[4..]) as usize;
     let types_len = LE::read_u32(&read_data[12..]) as usize;
+    for len in [symbol_len, types_len] {
+        if len > MAX_UPLOAD {
+            return Err(Error::Reply("getting symbol info", "upload length exceeds limit", len as u32));
+        }
+    }
 
     let mut type_data = vec![0; types_len];
     device.read_exact(index::SYM_DT_UPLOAD, 0, &mut type_data)?;

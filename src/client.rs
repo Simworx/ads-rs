@@ -436,7 +436,13 @@ impl Client {
             return ads_error(cmd.action(), resp_header.error_code.get());
         }
 
-        let result = LE::read_u32(&resp_buf[..4]);
+        let Some(result) = resp_buf.get(..4).map(LE::read_u32) else {
+            return Err(Error::Reply(
+                cmd.action(),
+                "reply shorter than its result field",
+                resp_buf.len() as u32,
+            ));
+        };
 
         // Check result field in payload, only relevant if error_code == 0.
         if result != 0 {
@@ -892,7 +898,11 @@ impl Device<'_> {
             &[header.as_bytes(), write_data],
             &mut [read_len.as_mut_bytes(), read_data],
         )?;
-        Ok(read_len.get() as usize)
+        let len = read_len.get();
+        if len as usize > read_data.len() {
+            return Err(Error::Reply("write/read data", "returned length exceeds buffer", len));
+        }
+        Ok(len as usize)
     }
 
     /// Like `write_read`, but ensure the returned data length matches the output buffer.
@@ -945,8 +955,7 @@ impl Device<'_> {
 
         // unfortunately SUMUP_READWRITE returns only the actual read bytes for each
         // request, so if there are short reads the buffers got filled wrongly
-        fixup_write_read_return_buffers(requests);
-        Ok(())
+        fixup_write_read_return_buffers(requests)
     }
 
     /// Return the ADS and device state of the device.
@@ -1332,7 +1341,12 @@ impl<'buf> ReadRequest<'buf> {
         if self.res.result.get() != 0 {
             ads_error("multi-read data", self.res.result.get())
         } else {
-            Ok(&self.rbuf[..self.res.length.get() as usize])
+            let len = self.res.length.get();
+            self.rbuf.get(..len as usize).ok_or(Error::Reply(
+                "multi-read data",
+                "returned length exceeds buffer",
+                len,
+            ))
         }
     }
 }
@@ -1404,7 +1418,12 @@ impl<'buf> WriteReadRequest<'buf> {
         if self.res.result.get() != 0 {
             ads_error("multi-read/write data", self.res.result.get())
         } else {
-            Ok(&self.rbuf[..self.res.length.get() as usize])
+            let len = self.res.length.get();
+            self.rbuf.get(..len as usize).ok_or(Error::Reply(
+                "multi-read/write data",
+                "returned length exceeds buffer",
+                len,
+            ))
         }
     }
 }
@@ -1503,7 +1522,11 @@ impl DelNotifRequest {
     }
 }
 
-fn fixup_write_read_return_buffers(requests: &mut [WriteReadRequest]) {
+fn fixup_write_read_return_buffers(requests: &mut [WriteReadRequest]) -> Result<()> {
+    if let Some(req) = requests.iter().find(|r| r.res.length.get() as usize > r.rbuf.len()) {
+        let len = req.res.length.get();
+        return Err(Error::Reply("multi-read/write data", "returned length exceeds buffer", len));
+    }
     // Calculate the initial (using buffer sizes) and actual (using result
     // sizes) offsets of each request.
     let offsets = requests
@@ -1511,7 +1534,6 @@ fn fixup_write_read_return_buffers(requests: &mut [WriteReadRequest]) {
         .scan((0, 0), |(init_cum, act_cum), req| {
             let (init, act) = (req.rbuf.len(), req.res.length.get() as usize);
             let current = Some((*init_cum, *act_cum, init, act));
-            assert!(init >= act);
             *init_cum += init;
             *act_cum += act;
             current
@@ -1554,6 +1576,7 @@ fn fixup_write_read_return_buffers(requests: &mut [WriteReadRequest]) {
             j_end = offsets[j].2;
         }
     }
+    Ok(())
 }
 
 #[test]
@@ -1579,11 +1602,37 @@ fn test_fixup_buffers() {
     reqs[4].res.length.set(2);
     reqs[5].res.length.set(9);
 
-    fixup_write_read_return_buffers(reqs);
+    fixup_write_read_return_buffers(reqs).unwrap();
 
     assert!(&reqs[5].rbuf[..9] == b"UVWXYZYXW");
     assert!(&reqs[4].rbuf[..2] == b"xy");
     assert!(&reqs[3].rbuf[..4] == b"abcd");
     assert!(&reqs[1].rbuf[..6] == b"ABCDEF");
     assert!(&reqs[0].rbuf[..8] == b"12345678");
+}
+
+#[test]
+fn test_multi_data_rejects_oversized_length() {
+    let mut buf = [0; 4];
+    let mut req = ReadRequest::new(0, 0, &mut buf);
+    req.res.length.set(100);
+    assert!(matches!(
+        req.data(),
+        Err(Error::Reply(_, "returned length exceeds buffer", 100))
+    ));
+    let mut buf = [0; 4];
+    let mut req = WriteReadRequest::new(0, 0, &[], &mut buf);
+    req.res.length.set(100);
+    assert!(matches!(
+        req.data(),
+        Err(Error::Reply(_, "returned length exceeds buffer", 100))
+    ));
+}
+
+#[test]
+fn test_fixup_buffers_rejects_oversized_length() {
+    let mut buf = [0; 4];
+    let reqs = &mut [WriteReadRequest::new(0, 0, &[], &mut buf)];
+    reqs[0].res.length.set(5);
+    assert!(fixup_write_read_return_buffers(reqs).is_err());
 }

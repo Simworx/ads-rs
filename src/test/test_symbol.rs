@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::symbol::{decode_symbol_info, get_type_info_by_name};
+use crate::symbol::{decode_symbol_info, get_symbol_info, get_type_info_by_name};
 use crate::test::{frame, scripted_server};
 use crate::{AmsAddr, AmsNetId, Client, Error, Source, Timeouts};
 
@@ -245,4 +245,27 @@ fn type_info_by_name_length_beyond_buffer() {
 fn type_info_by_name_entry_shorter_than_its_length_field() {
     let err = type_info_by_name_err(8, [2u32.to_le_bytes(), [0; 4]].concat());
     assert!(matches!(err, Error::Reply(_, "invalid entry length", 2)), "{:?}", err);
+}
+
+#[test]
+fn symbol_info_upload_length_beyond_limit() {
+    let port = scripted_server(|request| {
+        let mut info = [0u8; 64];
+        info[4..8].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        info[12..16].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        let payload = [&0u32.to_le_bytes()[..], &64u32.to_le_bytes(), &info].concat();
+        frame(request, request.command.get(), 5, &payload)
+    });
+    let client =
+        Client::new(("127.0.0.1", port), Timeouts::new(Duration::from_secs(1)), Source::Auto).unwrap();
+    let device = client.device(AmsAddr::new(AmsNetId::new(1, 2, 3, 4, 5, 6), 851));
+    let err = match get_symbol_info(device) {
+        Ok(_) => panic!("allocated a 4 GiB upload"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, Error::Reply(_, "upload length exceeds limit", 0xFFFF_FFFF)),
+        "{:?}",
+        err
+    );
 }
