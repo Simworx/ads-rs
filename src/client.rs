@@ -8,7 +8,7 @@ use std::net::{IpAddr, Shutdown, TcpStream, ToSocketAddrs};
 use std::str::FromStr;
 use std::sync::{
     atomic::{AtomicU32, Ordering},
-    Arc, Mutex,
+    Arc, Mutex, PoisonError,
 };
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -254,6 +254,9 @@ impl Client {
             }
         };
 
+        // Reply deadlines are kept per request by recv_timeout so an idle reader must not time out on the socket
+        socket.set_read_timeout(None).ctx("clearing client socket read timeout")?;
+
         // Clone the socket for the reader thread and create our channels for
         // bidirectional communication.
         let (notif_tx, notif_rx) = unbounded();
@@ -496,37 +499,39 @@ struct ClientReceiver {
     handle: Option<JoinHandle<Result<()>>>,
 }
 
+// Fails every pending request and closes the socket when the reader stops or panics.
+struct ReaderExit {
+    socket: TcpStream,
+    pending: PendingMap,
+    error: Option<Error>,
+}
+
+impl Drop for ReaderExit {
+    fn drop(&mut self) {
+        let _ = self.socket.shutdown(Shutdown::Both);
+        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        for (_, channel) in std::mem::take(&mut *pending) {
+            let err = self.error.clone().unwrap_or(Error::Reply(
+                "handling clean shutdown",
+                "pending request at client shutdown",
+                0,
+            ));
+            let _ = channel.send(Err(err));
+        }
+    }
+}
+
 impl ClientReceiver {
     fn start(
         &mut self, mut notif_tx: Sender<notif::Notification>, socket: &TcpStream, pending: PendingMap,
         source: AmsAddr,
     ) {
-        let mut socket = socket.try_clone().expect("socket cloning failed");
+        let socket = socket.try_clone().expect("socket cloning failed");
 
         let rx_worker = std::thread::spawn(move || {
-            let result = Self::reader_work(source, pending.clone(), &mut socket, &mut notif_tx);
-
-            let _ = socket.shutdown(Shutdown::Both);
-
-            if let Ok(ref mut pending) = pending.lock() {
-                let keys = pending.keys().cloned().collect_vec();
-                for key in keys {
-                    if let Some(channel) = pending.remove(&key) {
-                        let err = if let Err(e) = &result {
-                            Err(e.clone())
-                        } else {
-                            Err(Error::Reply(
-                                "handling clean shutdown",
-                                "pending request at client shutdown",
-                                0,
-                            ))
-                        };
-
-                        let _ = channel.send(err);
-                    };
-                }
-            }
-
+            let mut exit = ReaderExit { socket, pending, error: None };
+            let result = Self::reader_work(source, exit.pending.clone(), &mut exit.socket, &mut notif_tx);
+            exit.error = result.as_ref().err().cloned();
             result
         });
 
@@ -614,7 +619,7 @@ impl ClientReceiver {
             // If it looks like a reply, send it back to the requesting thread,
             // it will handle further validation.
             if ads_header.command != Command::Notification as u16 {
-                match pending.lock().expect("pending map lock poisoned").remove_entry(&invoke_id) {
+                match pending.lock().unwrap_or_else(PoisonError::into_inner).remove_entry(&invoke_id) {
                     Some((_, tx)) => {
                         if tx.send(Ok((ads_header, payload_buf))).is_err() {
                             return Err(Error::IoSync(
@@ -650,7 +655,10 @@ impl ClientReceiver {
                 if let Ok(notif) =
                     notif::Notification::new([ads_header_buf.as_slice(), &payload_buf].concat())
                 {
-                    notif_tx.send(notif).expect("never disconnects");
+                    // the client is gone once nobody holds a receiver
+                    if notif_tx.send(notif).is_err() {
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -1679,4 +1687,20 @@ fn test_fixup_buffers_rejects_oversized_length() {
     let reqs = &mut [WriteReadRequest::new(0, 0, &[], &mut buf)];
     reqs[0].res.length.set(5);
     assert!(fixup_write_read_return_buffers(reqs).is_err());
+}
+
+#[test]
+fn test_reader_exit_fails_pending_on_panic() {
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let pending = PendingMap::default();
+    let (tx, rx) = oneshot::channel();
+    pending.lock().unwrap().insert(1, tx);
+    let exit = ReaderExit { socket, pending, error: None };
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _exit = exit;
+        panic!("reader died");
+    }));
+    assert!(matches!(rx.recv_timeout(Duration::from_millis(100)), Ok(Err(Error::Reply(..)))));
 }

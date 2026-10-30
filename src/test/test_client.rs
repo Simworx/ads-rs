@@ -559,3 +559,15 @@ fn test_multi_length_beyond_buffer_stays_a_per_request_error() {
         ));
     });
 }
+
+#[test]
+fn test_idle_client_outlives_its_read_timeout() {
+    // The default test server answers while a timeout option would make it go silent
+    let port = config_test_server(ServerOpts::default());
+    let client =
+        Client::new(("127.0.0.1", port), Timeouts::new(Duration::from_millis(50)), Source::Auto).unwrap();
+    let device = client.device(AmsAddr::new(AmsNetId::new(1, 2, 3, 4, 5, 6), 851));
+    // Nothing crosses the wire for longer than the read timeout
+    std::thread::sleep(Duration::from_millis(200));
+    device.get_state().expect("a request after an idle period still works");
+}
