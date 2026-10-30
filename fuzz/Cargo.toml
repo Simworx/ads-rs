@@ -1,0 +1,33 @@
+[package]
+name = "ads-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ads = { path = "..", features = ["test-util"] }
+
+[[bin]]
+name = "decode_symbol_info"
+path = "fuzz_targets/decode_symbol_info.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frame_split"
+path = "fuzz_targets/frame_split.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "udp_parse"
+path = "fuzz_targets/udp_parse.rs"
+test = false
+doc = false
+bench = false
