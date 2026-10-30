@@ -440,3 +440,20 @@ fn test_read_length_beyond_buffer() {
         },
     );
 }
+
+#[test]
+fn test_samples_of_many_empty_stamps_do_not_overflow_the_stack() {
+    const STAMPS: u32 = 100_000;
+    let mut frame = vec![0; 42];
+    frame.extend_from_slice(&STAMPS.to_le_bytes());
+    frame.resize(frame.len() + 12 * STAMPS as usize, 0);
+    let notification = crate::notif::Notification::new(frame).unwrap();
+
+    let count = std::thread::Builder::new()
+        .stack_size(64 * 1024)
+        .spawn(move || notification.samples().count())
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(count, 0);
+}

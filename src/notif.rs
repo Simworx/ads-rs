@@ -133,23 +133,24 @@ impl<'a> Iterator for SampleIter<'a> {
     type Item = Sample<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.samples_left > 0 {
-            // Read more samples from the current stamp.
-            let handle = self.data.read_u32::<LE>().expect("size");
-            let length = self.data.read_u32::<LE>().expect("size") as usize;
-            let (data, rest) = self.data.split_at(length);
-            self.data = rest;
-            self.samples_left -= 1;
-            Some(Sample { handle, data, timestamp: self.cur_timestamp })
-        } else if self.stamps_left > 0 {
+        loop {
+            if self.samples_left > 0 {
+                // Read more samples from the current stamp.
+                let handle = self.data.read_u32::<LE>().expect("size");
+                let length = self.data.read_u32::<LE>().expect("size") as usize;
+                let (data, rest) = self.data.split_at(length);
+                self.data = rest;
+                self.samples_left -= 1;
+                return Some(Sample { handle, data, timestamp: self.cur_timestamp });
+            }
+            if self.stamps_left == 0 {
+                // Nothing else here.
+                return None;
+            }
             // Go to next stamp.
             self.cur_timestamp = self.data.read_u64::<LE>().expect("size");
             self.samples_left = self.data.read_u32::<LE>().expect("size");
             self.stamps_left -= 1;
-            self.next()
-        } else {
-            // Nothing else here.
-            None
         }
     }
 }
