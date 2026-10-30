@@ -714,7 +714,11 @@ impl Device<'_> {
             &mut [read_len.as_mut_bytes(), data],
         )?;
 
-        Ok(read_len.get() as usize)
+        let len = read_len.get();
+        if len as usize > data.len() {
+            return Err(Error::Reply("read data", "returned length exceeds buffer", len));
+        }
+        Ok(len as usize)
     }
 
     /// Read some data at a given index group/offset, ensuring that the returned data has

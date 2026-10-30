@@ -421,3 +421,22 @@ fn test_write_read_length_beyond_buffer() {
         },
     );
 }
+
+#[test]
+fn test_read_length_beyond_buffer() {
+    run_scripted(
+        |request| {
+            let payload = [0u32.to_le_bytes(), 100u32.to_le_bytes(), [0; 4]].concat();
+            frame(request, request.command.get(), 5, &payload)
+        },
+        |device| {
+            let mut buf = [0; 4];
+            let len = device.read(0, 0, &mut buf);
+            assert!(
+                matches!(len, Err(Error::Reply(_, "returned length exceeds buffer", 100))),
+                "{:?}",
+                len
+            );
+        },
+    );
+}
