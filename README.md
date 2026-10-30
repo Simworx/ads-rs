@@ -30,6 +30,8 @@ The fork's additions include:
   to the application objects that requested them.
 - PLC task information, including task timing and cycle counters, with readers
   that use the target's type metadata to interpret the layout.
+- A fake ADS server for tests behind the `test-util` feature
+  (`ads::test_util::FakeServer`), so consumers share one fake.
 
 We expect this direction to continue. Planned work includes more PLC and
 EtherCAT diagnostics, further refinements to client sharing and synchronisation

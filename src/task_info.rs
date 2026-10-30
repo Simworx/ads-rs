@@ -561,9 +561,8 @@ mod tests {
 
     #[test]
     fn reader_reads_values_and_preserves_count_failure() {
-        let port = crate::test::config_test_server(Default::default());
-        let client =
-            crate::Client::new(("127.0.0.1", port), crate::Timeouts::none(), crate::Source::Auto).unwrap();
+        let server = crate::test_util::FakeServer::start(Default::default()).unwrap();
+        let client = crate::Client::new(server.addr(), crate::Timeouts::none(), crate::Source::Auto).unwrap();
         let device = client.device(AmsAddr::new(crate::AmsNetId::new(1, 2, 3, 4, 5, 6), 851));
         let mut reader = reader(32, false);
         reader.target = device.address();

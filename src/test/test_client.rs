@@ -4,40 +4,49 @@ use std::convert::TryFrom;
 use std::io::{Read, Write};
 use std::time::Duration;
 
-use crate::client::{
-    AddNotifRequest, AdsHeader, Command, DelNotifRequest, ReadRequest, WriteReadRequest, WriteRequest,
-};
-use crate::test::{config_test_server, frame, scripted_server, ServerOpts};
+use crate::client::{AddNotifRequest, Command, DelNotifRequest, ReadRequest, WriteReadRequest, WriteRequest};
+use crate::test_util::{FakeServer, Handlers, Reply, Request};
 use crate::{AmsAddr, AmsNetId, Client, Device, Error, Source, Timeouts};
 
-fn run_test(opts: ServerOpts, f: impl Fn(Device)) {
-    let timeouts = if let Some(tmo) = opts.timeout { Timeouts::new(tmo) } else { Timeouts::none() };
-    let port = config_test_server(opts);
-    let client = Client::new(("127.0.0.1", port), timeouts, Source::Auto).unwrap();
+fn run_test(handlers: Handlers, f: impl Fn(Device)) {
+    run_test_with(handlers, Timeouts::none(), f)
+}
+
+fn run_test_with(handlers: Handlers, timeouts: Timeouts, f: impl Fn(Device)) {
+    let server = FakeServer::start(handlers).unwrap();
+    server.add_symbol("SYMBOL", &[0; 4]);
+    let client = Client::new(server.addr(), timeouts, Source::Auto).unwrap();
     f(client.device(AmsAddr::new(AmsNetId::new(1, 2, 3, 4, 5, 6), 851)));
+}
+
+fn run_scripted(reply: impl Fn(&Request) -> Vec<u8> + Send + 'static, f: impl Fn(Device)) {
+    let custom: crate::test_util::Handler = Box::new(move |request| Reply::Frame(reply(request)));
+    run_test_with(
+        Handlers { custom: Some(custom), ..Default::default() },
+        Timeouts::new(Duration::from_secs(1)),
+        f,
+    );
 }
 
 #[test]
 fn test_garbage_packet() {
-    run_test(ServerOpts { garbage_header: true, ..Default::default() }, |device| {
+    run_test(Handlers { garbage_header: true, ..Default::default() }, |device| {
         let _ = device.get_info().unwrap_err();
     })
 }
 
 #[test]
 fn test_timeout() {
-    run_test(
-        ServerOpts { timeout: Some(Duration::from_millis(1)), ..Default::default() },
-        |device| {
-            let err = device.get_info().unwrap_err();
-            assert!(matches!(err, Error::Timeout(_)), "unexpected error from timeout: {}", err);
-        },
-    )
+    let handlers = Handlers { custom: Some(Box::new(|_: &Request| Reply::Silent)), ..Default::default() };
+    run_test_with(handlers, Timeouts::new(Duration::from_millis(1)), |device| {
+        let err = device.get_info().unwrap_err();
+        assert!(matches!(err, Error::Timeout(_)), "unexpected error from timeout: {:?}", err);
+    })
 }
 
 #[test]
 fn test_wrong_invokeid() {
-    run_test(ServerOpts { ignore_invokeid: true, ..Default::default() }, |device| {
+    run_test(Handlers { ignore_invokeid: true, ..Default::default() }, |device| {
         assert!(matches!(
             device.get_info().unwrap_err(),
             Error::Reply(_, "invalid invoke id received from server, aborting connection", _)
@@ -47,7 +56,7 @@ fn test_wrong_invokeid() {
 
 #[test]
 fn test_devinfo() {
-    run_test(ServerOpts::default(), |device| {
+    run_test(Handlers::default(), |device| {
         let info = device.get_info().unwrap();
         assert_eq!(info.version, 4024);
         assert_eq!(info.name, "Nice device");
@@ -56,7 +65,7 @@ fn test_devinfo() {
 
 #[test]
 fn test_state() {
-    run_test(ServerOpts::default(), |device| {
+    run_test(Handlers::default(), |device| {
         device.write_control(crate::AdsState::Config, 42).unwrap();
         assert_eq!(device.get_state().unwrap(), (crate::AdsState::Config, 42));
         assert!(device.write_control(crate::AdsState::Invalid, 42).is_err());
@@ -65,7 +74,7 @@ fn test_state() {
 
 #[test]
 fn test_readwrite() {
-    run_test(ServerOpts::default(), |device| {
+    run_test(Handlers::default(), |device| {
         let data = [1, 6, 8, 9];
         let mut buf = [0; 4];
         device.write(0x4020, 7, &data).unwrap();
@@ -87,7 +96,7 @@ fn test_readwrite() {
 fn test_multi_requests() {
     use crate::client::*;
     use crate::index::*;
-    run_test(ServerOpts::default(), |device| {
+    run_test(Handlers::default(), |device| {
         let mut buf1 = *b"ABCDEFGHIJ";
         let mut buf2 = *b"0123456789";
         let mut buf3 = *b"-----";
@@ -127,7 +136,7 @@ fn test_multi_requests() {
 #[test]
 fn test_fileaccess() {
     use crate::file::*;
-    run_test(ServerOpts::default(), |device| {
+    run_test(Handlers::default(), |device| {
         assert!(File::open(device, "blub", 0).is_err());
         let mut file = File::open(device, "/etc/passwd", WRITE).unwrap();
         assert!(File::open(device, "/etc/passwd", 0).is_err());
@@ -151,7 +160,7 @@ fn test_fileaccess() {
 #[test]
 fn test_symbolaccess() {
     use crate::symbol::*;
-    run_test(ServerOpts::default(), |device| {
+    run_test(Handlers::default(), |device| {
         assert!(Handle::new(device, "blub").is_err());
         let handle = Handle::new(device, "SYMBOL").unwrap();
         assert!(handle.write(&[1, 2, 3, 4, 5]).is_err());
@@ -173,7 +182,7 @@ fn test_symbolaccess() {
 fn test_notification() {
     use crate::notif::*;
     use std::time::Duration;
-    run_test(ServerOpts::default(), |device| {
+    run_test(Handlers::default(), |device| {
         let chan = device.client.get_notification_channel();
 
         let attrib = Attributes::new(
@@ -212,7 +221,7 @@ fn test_multi_notification() {
     use crate::client::*;
     use crate::notif::*;
     use std::time::Duration;
-    run_test(ServerOpts::default(), |device| {
+    run_test(Handlers::default(), |device| {
         let attrib = Attributes::new(
             4,
             TransmissionMode::ServerOnChange,
@@ -262,7 +271,7 @@ fn test_multi_notification() {
 fn test_bad_notification() {
     use crate::notif::*;
     use std::time::Duration;
-    run_test(ServerOpts { bad_notif: true, ..Default::default() }, |device| {
+    run_test(Handlers { bad_notif: true, ..Default::default() }, |device| {
         let chan = device.client.get_notification_channel();
 
         let attrib = Attributes::new(
@@ -285,7 +294,7 @@ fn test_bad_notification() {
 fn test_string_type() {
     type String5 = crate::strings::String<5>;
 
-    run_test(ServerOpts::default(), |device| {
+    run_test(Handlers::default(), |device| {
         let mut bstr = String5::try_from("abc").unwrap();
         assert!(<[u8; 5]>::from(bstr) == [b'a', b'b', b'c', 0, 0]);
         assert!(bstr == &b"abc"[..]);
@@ -314,7 +323,7 @@ fn test_string_type() {
 fn test_wstring_type() {
     type WString5 = crate::strings::WString<5>;
 
-    run_test(ServerOpts::default(), |device| {
+    run_test(Handlers::default(), |device| {
         let mut wstr = WString5::try_from("abc").unwrap();
         assert!(<[u16; 5]>::from(wstr) == [b'a' as u16, b'b' as u16, b'c' as u16, 0, 0]);
         assert!(wstr == &[b'a' as u16, b'b' as u16, b'c' as u16][..]);
@@ -340,21 +349,14 @@ fn test_wstring_type() {
     })
 }
 
-fn run_scripted(reply: impl Fn(&AdsHeader) -> Vec<u8> + Send + 'static, f: impl Fn(Device)) {
-    let port = scripted_server(reply);
-    let timeouts = Timeouts::new(Duration::from_secs(1));
-    let client = Client::new(("127.0.0.1", port), timeouts, Source::Auto).unwrap();
-    f(client.device(AmsAddr::new(AmsNetId::new(1, 2, 3, 4, 5, 6), 851)));
-}
-
 #[test]
 fn test_short_notification_is_skipped() {
     run_scripted(
         |request| {
             let mut state = 0u32.to_le_bytes().to_vec();
             state.extend([5, 0, 0, 0]);
-            let notif = frame(request, Command::Notification as u16, 4, &[]);
-            [notif, frame(request, request.command.get(), 5, &state)].concat()
+            let notif = request.frame(Command::Notification as u16, 4, &[]);
+            [notif, request.frame(request.command(), 5, &state)].concat()
         },
         |device| assert_eq!(device.get_state().unwrap(), (crate::AdsState::Run, 0)),
     );
@@ -364,7 +366,7 @@ fn test_short_notification_is_skipped() {
 fn test_inconsistent_lengths_fail_pending_request() {
     run_scripted(
         |request| {
-            let mut bad = frame(request, request.command.get(), 5, &[0; 8]);
+            let mut bad = request.frame(request.command(), 5, &[0; 8]);
             bad[26..30].copy_from_slice(&1_000_000u32.to_le_bytes());
             bad
         },
@@ -379,7 +381,7 @@ fn test_inconsistent_lengths_fail_pending_request() {
 #[test]
 fn test_short_reply_is_an_error() {
     run_scripted(
-        |request| frame(request, request.command.get(), 5, &[]),
+        |request| request.frame(request.command(), 5, &[]),
         |device| {
             let err = device.get_state().unwrap_err();
             let expected = "reply shorter than its result field";
@@ -393,7 +395,7 @@ fn test_write_read_length_beyond_buffer() {
     run_scripted(
         |request| {
             let payload = [0u32.to_le_bytes(), 100u32.to_le_bytes(), [0; 4]].concat();
-            frame(request, request.command.get(), 5, &payload)
+            request.frame(request.command(), 5, &payload)
         },
         |device| {
             let err = device.write_read(0, 0, &[], &mut [0; 4]).unwrap_err();
@@ -407,11 +409,20 @@ fn test_write_read_length_beyond_buffer() {
 }
 
 #[test]
+fn test_idle_client_outlives_its_read_timeout() {
+    run_test_with(Handlers::default(), Timeouts::new(Duration::from_millis(50)), |device| {
+        // Nothing crosses the wire for longer than the read timeout
+        std::thread::sleep(Duration::from_millis(200));
+        device.get_state().expect("a request after an idle period still works");
+    })
+}
+
+#[test]
 fn test_read_length_beyond_buffer() {
     run_scripted(
         |request| {
             let payload = [0u32.to_le_bytes(), 100u32.to_le_bytes(), [0; 4]].concat();
-            frame(request, request.command.get(), 5, &payload)
+            request.frame(request.command(), 5, &payload)
         },
         |device| {
             let mut buf = [0; 4];
@@ -423,6 +434,54 @@ fn test_read_length_beyond_buffer() {
             );
         },
     );
+}
+
+#[test]
+fn test_drop_does_not_wait_for_silent_server() {
+    use crate::notif::{Attributes, TransmissionMode};
+    use std::time::Instant;
+    let server = FakeServer::start(Handlers { silent_after: Some(1), ..Default::default() }).unwrap();
+    let timeouts = Timeouts::new(Duration::from_secs(2));
+    let client = Client::new(server.addr(), timeouts, Source::Auto).unwrap();
+    let device = client.device(AmsAddr::new(AmsNetId::new(1, 2, 3, 4, 5, 6), 851));
+    let attrib = Attributes::new(
+        4,
+        TransmissionMode::ServerOnChange,
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+    );
+    device.add_notification(0x4020, 0, &attrib).unwrap();
+    let start = Instant::now();
+    drop(client);
+    assert!(start.elapsed() < Duration::from_secs(1), "drop took {:?}", start.elapsed());
+}
+
+#[test]
+fn test_drop_survives_poisoned_socket_lock() {
+    use crate::notif::{Attributes, TransmissionMode};
+    use std::time::Instant;
+    let server = FakeServer::start(Handlers::default()).unwrap();
+    let client = Client::new(server.addr(), Timeouts::new(Duration::from_secs(2)), Source::Auto).unwrap();
+    let device = client.device(AmsAddr::new(AmsNetId::new(1, 2, 3, 4, 5, 6), 851));
+    let attrib = Attributes::new(
+        4,
+        TransmissionMode::ServerOnChange,
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+    );
+    device.add_notification(0x4020, 0, &attrib).unwrap();
+    let joined = std::thread::scope(|s| {
+        s.spawn(|| {
+            let _guard = client.socket.lock().unwrap();
+            panic!("poisoning the socket lock");
+        })
+        .join()
+    });
+    assert!(joined.is_err() && client.socket.is_poisoned());
+    let start = Instant::now();
+    let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(client)));
+    assert!(dropped.is_ok(), "drop panicked");
+    assert!(start.elapsed() < Duration::from_secs(1), "drop took {:?}", start.elapsed());
 }
 
 #[test]
@@ -448,7 +507,7 @@ fn run_with_payload(words: &'static [u32], data: &'static [u8], f: impl Fn(Devic
             let mut payload = 0u32.to_le_bytes().to_vec();
             words.iter().for_each(|word| payload.extend_from_slice(&word.to_le_bytes()));
             payload.extend_from_slice(data);
-            frame(request, request.command.get(), 5, &payload)
+            request.frame(request.command(), 5, &payload)
         },
         f,
     );
@@ -561,67 +620,6 @@ fn test_multi_length_beyond_buffer_stays_a_per_request_error() {
 }
 
 #[test]
-fn test_idle_client_outlives_its_read_timeout() {
-    // The default test server answers while a timeout option would make it go silent
-    let port = config_test_server(ServerOpts::default());
-    let client =
-        Client::new(("127.0.0.1", port), Timeouts::new(Duration::from_millis(50)), Source::Auto).unwrap();
-    let device = client.device(AmsAddr::new(AmsNetId::new(1, 2, 3, 4, 5, 6), 851));
-    // Nothing crosses the wire for longer than the read timeout
-    std::thread::sleep(Duration::from_millis(200));
-    device.get_state().expect("a request after an idle period still works");
-}
-
-#[test]
-fn test_drop_does_not_wait_for_silent_server() {
-    use crate::notif::{Attributes, TransmissionMode};
-    use std::time::Instant;
-    let port = config_test_server(ServerOpts { silent_after: Some(1), ..Default::default() });
-    let timeouts = Timeouts::new(Duration::from_secs(2));
-    let client = Client::new(("127.0.0.1", port), timeouts, Source::Auto).unwrap();
-    let device = client.device(AmsAddr::new(AmsNetId::new(1, 2, 3, 4, 5, 6), 851));
-    let attrib = Attributes::new(
-        4,
-        TransmissionMode::ServerOnChange,
-        Duration::from_secs(1),
-        Duration::from_secs(1),
-    );
-    device.add_notification(0x4020, 0, &attrib).unwrap();
-    let start = Instant::now();
-    drop(client);
-    assert!(start.elapsed() < Duration::from_secs(1), "drop took {:?}", start.elapsed());
-}
-
-#[test]
-fn test_drop_survives_poisoned_socket_lock() {
-    use crate::notif::{Attributes, TransmissionMode};
-    use std::time::Instant;
-    let port = config_test_server(ServerOpts::default());
-    let client =
-        Client::new(("127.0.0.1", port), Timeouts::new(Duration::from_secs(2)), Source::Auto).unwrap();
-    let device = client.device(AmsAddr::new(AmsNetId::new(1, 2, 3, 4, 5, 6), 851));
-    let attrib = Attributes::new(
-        4,
-        TransmissionMode::ServerOnChange,
-        Duration::from_secs(1),
-        Duration::from_secs(1),
-    );
-    device.add_notification(0x4020, 0, &attrib).unwrap();
-    let joined = std::thread::scope(|s| {
-        s.spawn(|| {
-            let _guard = client.socket.lock().unwrap();
-            panic!("poisoning the socket lock");
-        })
-        .join()
-    });
-    assert!(joined.is_err() && client.socket.is_poisoned());
-    let start = Instant::now();
-    let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(client)));
-    assert!(dropped.is_ok(), "drop panicked");
-    assert!(start.elapsed() < Duration::from_secs(1), "drop took {:?}", start.elapsed());
-}
-
-#[test]
 fn test_failed_write_discards_pending_and_stops_later_requests() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -656,20 +654,18 @@ fn test_failed_write_discards_pending_and_stops_later_requests() {
 
 #[test]
 fn test_file_timeout_keeps_its_io_kind() {
-    let answered = std::sync::atomic::AtomicBool::new(false);
-    run_scripted(
-        move |request| {
-            // answers the open with a handle and then goes silent
-            if answered.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                return Vec::new();
-            }
-            let payload = [0u32, 4, 1].iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
-            frame(request, request.command.get(), 5, &payload)
-        },
-        |device| {
-            let mut file = crate::file::File::open(device, "/etc/passwd", crate::file::READ).unwrap();
-            let err = file.read(&mut [0; 4]).unwrap_err();
-            assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
-        },
-    );
+    let requests = std::sync::atomic::AtomicU32::new(0);
+    let custom: crate::test_util::Handler =
+        Box::new(
+            move |_: &Request| match requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => Reply::Default,
+                _ => Reply::Silent,
+            },
+        );
+    let handlers = Handlers { custom: Some(custom), ..Default::default() };
+    run_test_with(handlers, Timeouts::new(Duration::from_millis(50)), |device| {
+        let mut file = crate::file::File::open(device, "/etc/passwd", crate::file::READ).unwrap();
+        let err = file.read(&mut [0; 4]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    });
 }

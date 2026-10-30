@@ -29,5 +29,5 @@ jobs:
           components: clippy, rustfmt
           toolchain: ${{ matrix.toolchain }}
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets
-      - run: cargo test --all
+      - run: cargo clippy --all-targets --features test-util
+      - run: cargo test --all --features test-util

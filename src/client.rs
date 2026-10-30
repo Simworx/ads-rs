@@ -25,7 +25,7 @@ use crate::{AmsAddr, AmsNetId, Error, Result};
 use zerocopy::byteorder::little_endian::{U16, U32};
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes};
 
-type PendingMap = Arc<Mutex<BTreeMap<u32, oneshot::Sender<Result<(AdsHeader, Vec<u8>)>>>>>;
+pub(crate) type PendingMap = Arc<Mutex<BTreeMap<u32, oneshot::Sender<Result<(AdsHeader, Vec<u8>)>>>>>;
 
 /// An ADS protocol command.
 // https://infosys.beckhoff.com/content/1033/tc3_ads_intro/115847307.html?id=7738940192708835096
@@ -516,7 +516,7 @@ impl Client {
 // Implementation detail: reader thread that takes replies and notifications
 // and distributes them accordingly.
 #[derive(Debug, Default)]
-struct ClientReceiver {
+pub(crate) struct ClientReceiver {
     handle: Option<JoinHandle<Result<()>>>,
 }
 
@@ -559,7 +559,7 @@ impl ClientReceiver {
         let _ = self.handle.insert(rx_worker);
     }
 
-    fn reader_work(
+    pub(crate) fn reader_work(
         source: AmsAddr, pending: PendingMap, socket_rx: &mut impl Read,
         notif_tx: &mut Sender<notif::Notification>,
     ) -> Result<()> {

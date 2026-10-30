@@ -55,6 +55,10 @@ pub mod symbol;
 pub mod task_info;
 #[cfg(test)]
 mod test;
+#[cfg(any(test, feature = "test-util"))]
+#[allow(clippy::unwrap_used)]
+/// A fake ADS device on a local TCP port for tests.
+pub mod test_util;
 pub mod udp;
 
 pub use client::{AdsState, Client, Device, Source, Timeouts};

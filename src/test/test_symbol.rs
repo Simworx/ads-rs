@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use crate::symbol::{decode_symbol_info, get_symbol_info, get_type_info_by_name};
-use crate::test::{frame, scripted_server};
+use crate::test_util::{FakeServer, Handlers, Reply};
 use crate::{AmsAddr, AmsNetId, Client, Error, Source, Timeouts};
 
 // Struct used to avoid clippy::too_many_arguments on build_type_entry.
@@ -216,14 +216,18 @@ fn array_bounds_overflow() {
     assert!(matches!(err, Error::Reply(_, "array bounds overflow", 0)), "{:?}", err);
 }
 
+// Answers every request with the frame `reply` builds.
+fn scripted_server(reply: impl FnMut(&crate::test_util::Request) -> Reply + Send + 'static) -> FakeServer {
+    FakeServer::start(Handlers { custom: Some(Box::new(reply)), ..Default::default() }).unwrap()
+}
+
 // Answers a type info request with `read_len` as the returned length and `data` as the bytes.
 fn type_info_by_name_err(read_len: u32, data: Vec<u8>) -> Error {
-    let port = scripted_server(move |request| {
+    let server = scripted_server(move |request| {
         let payload = [&0u32.to_le_bytes()[..], &read_len.to_le_bytes(), &data].concat();
-        frame(request, request.command.get(), 5, &payload)
+        Reply::Frame(request.frame(request.command(), 5, &payload))
     });
-    let client =
-        Client::new(("127.0.0.1", port), Timeouts::new(Duration::from_secs(1)), Source::Auto).unwrap();
+    let client = Client::new(server.addr(), Timeouts::new(Duration::from_secs(1)), Source::Auto).unwrap();
     let device = client.device(AmsAddr::new(AmsNetId::new(1, 2, 3, 4, 5, 6), 851));
     match get_type_info_by_name(device, "T") {
         Ok(_) => panic!("decoded corrupt type info"),
@@ -249,15 +253,14 @@ fn type_info_by_name_entry_shorter_than_its_length_field() {
 
 #[test]
 fn symbol_info_upload_length_beyond_limit() {
-    let port = scripted_server(|request| {
+    let server = scripted_server(|request| {
         let mut info = [0u8; 64];
         info[4..8].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
         info[12..16].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
         let payload = [&0u32.to_le_bytes()[..], &64u32.to_le_bytes(), &info].concat();
-        frame(request, request.command.get(), 5, &payload)
+        Reply::Frame(request.frame(request.command(), 5, &payload))
     });
-    let client =
-        Client::new(("127.0.0.1", port), Timeouts::new(Duration::from_secs(1)), Source::Auto).unwrap();
+    let client = Client::new(server.addr(), Timeouts::new(Duration::from_secs(1)), Source::Auto).unwrap();
     let device = client.device(AmsAddr::new(AmsNetId::new(1, 2, 3, 4, 5, 6), 851));
     let err = match get_symbol_info(device) {
         Ok(_) => panic!("allocated a 4 GiB upload"),
