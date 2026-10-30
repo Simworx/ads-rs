@@ -338,6 +338,25 @@ fn read_str(ptr: &mut &[u8], len: usize) -> Result<String> {
     }
 }
 
+// Splits off `len` bytes or fails when the data is shorter.
+fn take_bytes<'a>(ptr: &mut &'a [u8], len: usize, ctx: &'static str) -> Result<&'a [u8]> {
+    if len > ptr.len() {
+        return Err(Error::Reply(ctx, "length exceeds remaining data", len as u32));
+    }
+    let (head, rest) = ptr.split_at(len);
+    *ptr = rest;
+    Ok(head)
+}
+
+// Splits off one entry whose u32 length prefix counts its own four bytes.
+fn take_entry<'a>(ptr: &mut &'a [u8], ctx: &'static str) -> Result<&'a [u8]> {
+    let len = ptr.read_u32::<LE>().ctx(ctx)?;
+    match (len as usize).checked_sub(4) {
+        Some(body) if body <= ptr.len() => take_bytes(ptr, body, ctx),
+        _ => Err(Error::Reply(ctx, "invalid entry length", len)),
+    }
+}
+
 fn parse_guid(ptr: &mut &[u8]) -> Result<String> {
     let ctx = "parsing GUID";
     let mut g = [0u8; 16];
@@ -359,10 +378,7 @@ fn parse_guid(ptr: &mut &[u8]) -> Result<String> {
 }
 
 fn skip_copy_mask(ptr: &mut &[u8], size: usize) -> Result<()> {
-    let ctx = "skipping copy mask";
-    let mut mask = vec![0u8; size];
-    ptr.read_exact(&mut mask).ctx(ctx)?;
-    Ok(())
+    take_bytes(ptr, size, "skipping copy mask").map(drop)
 }
 
 fn parse_attributes(ptr: &mut &[u8]) -> Result<Vec<Attribute>> {
@@ -386,8 +402,11 @@ fn parse_enum_infos(ptr: &mut &[u8], size: usize, base_type: u32) -> Result<Vec<
     for _ in 0..count {
         let name_len = ptr.read_u8().ctx(ctx)? as usize;
         let name = read_str(ptr, name_len)?;
-        let mut raw = vec![0u8; size];
-        ptr.read_exact(&mut raw).ctx(ctx)?;
+        let bytes = take_bytes(ptr, size, ctx)?;
+        // short values are zero padded so the base type reads below stay in bounds
+        let mut raw = [0u8; 8];
+        let n = bytes.len().min(raw.len());
+        raw[..n].copy_from_slice(&bytes[..n]);
         let value: i64 = match base_type {
             2 => i16::from_le_bytes(raw[..2].try_into().unwrap_or([0; 2])) as i64,
             3 => i32::from_le_bytes(raw[..4].try_into().unwrap_or([0; 4])) as i64,
@@ -417,13 +436,7 @@ fn parse_method_infos(ptr: &mut &[u8]) -> Result<Vec<RpcMethod>> {
     let count = ptr.read_u16::<LE>().ctx(ctx)? as usize;
     let mut methods = Vec::with_capacity(count);
     for _ in 0..count {
-        let entry_len = ptr.read_u32::<LE>().ctx(ctx)? as usize;
-        if entry_len < 4 {
-            return Err(Error::Reply(ctx, "invalid method entry length", entry_len as u32));
-        }
-        let (method_data, rest) = ptr.split_at(entry_len - 4);
-        methods.push(parse_rpc_method(method_data)?);
-        *ptr = rest;
+        methods.push(parse_rpc_method(take_entry(ptr, ctx)?)?);
     }
     Ok(methods)
 }
@@ -452,13 +465,7 @@ fn parse_rpc_method(mut ptr: &[u8]) -> Result<RpcMethod> {
 
     let mut parameters = Vec::with_capacity(param_count);
     for _ in 0..param_count {
-        let entry_len = ptr.read_u32::<LE>().ctx(ctx)? as usize;
-        if entry_len < 4 {
-            return Err(Error::Reply(ctx, "invalid parameter entry length", entry_len as u32));
-        }
-        let (param_data, rest) = ptr.split_at(entry_len - 4);
-        parameters.push(parse_rpc_method_parameter(param_data)?);
-        ptr = rest;
+        parameters.push(parse_rpc_method_parameter(take_entry(&mut ptr, ctx)?)?);
     }
 
     let mut attributes = Vec::new();
@@ -578,7 +585,8 @@ fn decode_type_info(mut ptr: &[u8], parent: Option<&mut Type>) -> Result<Option<
     for _ in 0..array_dim {
         let lower = ptr.read_i32::<LE>().ctx(ctx)?;
         let total = ptr.read_i32::<LE>().ctx(ctx)?;
-        array.push((lower, lower + total - 1));
+        let upper = lower.checked_add(total).and_then(|end| end.checked_sub(1));
+        array.push((lower, upper.ok_or(Error::Reply(ctx, "array bounds overflow", total as u32))?));
     }
 
     if let Some(parent) = parent {
@@ -615,13 +623,7 @@ fn decode_type_info(mut ptr: &[u8], parent: Option<&mut Type>) -> Result<Option<
         };
 
         for _ in 0..sub_items {
-            let sub_size = ptr.read_u32::<LE>().ctx(ctx)? as usize;
-            if sub_size < 4 {
-                return Err(Error::Reply(ctx, "invalid sub-item entry length", sub_size as u32));
-            }
-            let (sub_ptr, rest) = ptr.split_at(sub_size - 4);
-            decode_type_info(sub_ptr, Some(&mut typinfo))?;
-            ptr = rest;
+            decode_type_info(take_entry(&mut ptr, ctx)?, Some(&mut typinfo))?;
         }
 
         parse_type_flags(&mut ptr, &mut typinfo)?;
@@ -663,11 +665,9 @@ pub fn decode_symbol_info(symbol_data: Vec<u8>, type_data: Vec<u8>) -> Result<(V
     let mut type_map = HashMap::new();
 
     while !data_ptr.is_empty() {
-        let entry_size = data_ptr.read_u32::<LE>().ctx("decoding type info")? as usize;
-        let (entry_ptr, rest) = data_ptr.split_at(entry_size - 4);
-        let typ = decode_type_info(entry_ptr, None)?.expect("base type");
+        let entry_ptr = take_entry(&mut data_ptr, "decoding type info")?;
+        let typ = decode_type_info(entry_ptr, None)?.ok_or(Error::Other("expected top-level type"))?;
         type_map.insert(typ.name.clone(), typ);
-        data_ptr = rest;
     }
 
     // Decode the symbol info.
@@ -675,8 +675,7 @@ pub fn decode_symbol_info(symbol_data: Vec<u8>, type_data: Vec<u8>) -> Result<(V
     let mut data_ptr = symbol_data.as_slice();
     let ctx = "decoding symbol info";
     while !data_ptr.is_empty() {
-        let entry_size = data_ptr.read_u32::<LE>().ctx(ctx)? as usize;
-        let (mut entry_ptr, rest) = data_ptr.split_at(entry_size - 4);
+        let mut entry_ptr = take_entry(&mut data_ptr, ctx)?;
         let ix_group = entry_ptr.read_u32::<LE>().ctx(ctx)?;
         let ix_offset = entry_ptr.read_u32::<LE>().ctx(ctx)?;
         let size = entry_ptr.read_u32::<LE>().ctx(ctx)? as usize;
@@ -696,8 +695,6 @@ pub fn decode_symbol_info(symbol_data: Vec<u8>, type_data: Vec<u8>) -> Result<(V
         // - if flags2 has Old names
 
         symbols.push(Symbol { name, ix_group, ix_offset, typ, size, base_type, flags });
-
-        data_ptr = rest;
     }
 
     Ok((symbols, type_map))
@@ -708,15 +705,16 @@ pub fn decode_symbol_info(symbol_data: Vec<u8>, type_data: Vec<u8>) -> Result<(V
 /// Returns a fully parsed [`Type`] including GUID, attributes, enum infos,
 /// and RPC methods when present.
 pub fn get_type_info_by_name(device: Device<'_>, type_name: &str) -> Result<Type> {
+    let ctx = "getting type info by name";
     let mut read_data = vec![0u8; 4096];
     let n = device.write_read(index::GET_TYPEINFO_BYNAME_EX, 0, type_name.as_bytes(), &mut read_data)?;
-    let data = &read_data[..n];
+    let mut data = read_data
+        .get(..n)
+        .ok_or(Error::Reply(ctx, "returned length exceeds buffer", n as u32))?;
     if data.len() < 4 {
         return Err(Error::Reply("get type info by name", "response too short", data.len() as u32));
     }
-    let entry_length = u32::from_le_bytes(data[..4].try_into().expect("entry length")) as usize;
-    let body_end = entry_length.min(data.len());
-    decode_type_info_by_name(&data[4..body_end])
+    decode_type_info_by_name(take_entry(&mut data, ctx)?)
 }
 
 /// Decode a type info response from `GET_TYPEINFO_BYNAME_EX` (0xF011).

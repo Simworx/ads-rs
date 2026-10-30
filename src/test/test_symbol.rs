@@ -1,4 +1,8 @@
-use crate::symbol::decode_symbol_info;
+use std::time::Duration;
+
+use crate::symbol::{decode_symbol_info, get_type_info_by_name};
+use crate::test::{frame, scripted_server};
+use crate::{AmsAddr, AmsNetId, Client, Error, Source, Timeouts};
 
 // Struct used to avoid clippy::too_many_arguments on build_type_entry.
 struct TypeEntryBuilder<'a> {
@@ -137,4 +141,108 @@ fn decode_struct_type_from_bytes() {
     assert_eq!(f1.offset, Some(2));
     assert_eq!(f1.size, 2);
     assert_eq!(f1.base_type, 2);
+}
+
+fn entry(flags: u32, size: u32, base_type: u32, array_dims: &[(i32, i32)], sub_items: &[Vec<u8>]) -> Vec<u8> {
+    build_type_entry(&TypeEntryBuilder {
+        name: "T",
+        type_name: "",
+        comment: "",
+        size,
+        offset: 0,
+        base_type,
+        flags,
+        array_dims,
+        sub_items,
+    })
+}
+
+// Re-frames a built type entry with `extra` appended inside it.
+fn with_trailer(entry: Vec<u8>, extra: &[u8]) -> Vec<u8> {
+    let body = [&entry[4..], extra].concat();
+    [&((body.len() + 4) as u32).to_le_bytes()[..], &body].concat()
+}
+
+fn decode_err(type_data: Vec<u8>, symbol_data: Vec<u8>) -> Error {
+    match decode_symbol_info(symbol_data, type_data) {
+        Ok(_) => panic!("decoded corrupt symbol data"),
+        Err(e) => e,
+    }
+}
+
+#[test]
+fn type_entry_shorter_than_its_length_field() {
+    let err = decode_err(0u32.to_le_bytes().to_vec(), vec![]);
+    assert!(matches!(err, Error::Reply(_, "invalid entry length", 0)), "{:?}", err);
+}
+
+#[test]
+fn type_entry_longer_than_data() {
+    let err = decode_err([100u32.to_le_bytes(), [0; 4]].concat(), vec![]);
+    assert!(matches!(err, Error::Reply(_, "invalid entry length", 100)), "{:?}", err);
+}
+
+#[test]
+fn symbol_entry_longer_than_data() {
+    let err = decode_err(vec![], [100u32.to_le_bytes(), [0; 4]].concat());
+    assert!(matches!(err, Error::Reply(_, "invalid entry length", 100)), "{:?}", err);
+}
+
+#[test]
+fn method_entry_longer_than_type() {
+    let err = decode_err(with_trailer(entry(0x800, 0, 0, &[], &[]), &[1, 0, 0xE8, 3, 0, 0]), vec![]);
+    assert!(matches!(err, Error::Reply(_, "invalid entry length", 1000)), "{:?}", err);
+}
+
+#[test]
+fn sub_item_longer_than_type() {
+    let err = decode_err(entry(0, 0, 0, &[], &[vec![0xFF, 0, 0, 0]]), vec![]);
+    assert!(matches!(err, Error::Reply(_, "invalid entry length", 255)), "{:?}", err);
+}
+
+#[test]
+fn enum_value_shorter_than_base_type() {
+    let data = with_trailer(entry(0x2000, 0, 2, &[], &[]), &[1, 0, 1, b'A', 0]);
+    let (_, types) = decode_symbol_info(vec![], data).unwrap_or_else(|e| panic!("{}", e));
+    assert_eq!(types["T"].enum_info.as_ref().unwrap()[0].value, 0);
+}
+
+#[test]
+fn array_bounds_overflow() {
+    let mut data = entry(0, 0, 0, &[(0, 0)], &[]);
+    data[46..50].copy_from_slice(&i32::MIN.to_le_bytes());
+    data[50..54].copy_from_slice(&0i32.to_le_bytes());
+    let err = decode_err(data, vec![]);
+    assert!(matches!(err, Error::Reply(_, "array bounds overflow", 0)), "{:?}", err);
+}
+
+// Answers a type info request with `read_len` as the returned length and `data` as the bytes.
+fn type_info_by_name_err(read_len: u32, data: Vec<u8>) -> Error {
+    let port = scripted_server(move |request| {
+        let payload = [&0u32.to_le_bytes()[..], &read_len.to_le_bytes(), &data].concat();
+        frame(request, request.command.get(), 5, &payload)
+    });
+    let client =
+        Client::new(("127.0.0.1", port), Timeouts::new(Duration::from_secs(1)), Source::Auto).unwrap();
+    let device = client.device(AmsAddr::new(AmsNetId::new(1, 2, 3, 4, 5, 6), 851));
+    match get_type_info_by_name(device, "T") {
+        Ok(_) => panic!("decoded corrupt type info"),
+        Err(e) => e,
+    }
+}
+
+#[test]
+fn type_info_by_name_length_beyond_buffer() {
+    let err = type_info_by_name_err(5000, entry(0, 0, 0, &[], &[]));
+    assert!(
+        matches!(err, Error::Reply(_, "returned length exceeds buffer", 5000)),
+        "{:?}",
+        err
+    );
+}
+
+#[test]
+fn type_info_by_name_entry_shorter_than_its_length_field() {
+    let err = type_info_by_name_err(8, [2u32.to_le_bytes(), [0; 4]].concat());
+    assert!(matches!(err, Error::Reply(_, "invalid entry length", 2)), "{:?}", err);
 }
