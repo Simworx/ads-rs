@@ -653,3 +653,23 @@ fn test_failed_write_discards_pending_and_stops_later_requests() {
     drop(client);
     server.join().unwrap();
 }
+
+#[test]
+fn test_file_timeout_keeps_its_io_kind() {
+    let answered = std::sync::atomic::AtomicBool::new(false);
+    run_scripted(
+        move |request| {
+            // answers the open with a handle and then goes silent
+            if answered.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return Vec::new();
+            }
+            let payload = [0u32, 4, 1].iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
+            frame(request, request.command.get(), 5, &payload)
+        },
+        |device| {
+            let mut file = crate::file::File::open(device, "/etc/passwd", crate::file::READ).unwrap();
+            let err = file.read(&mut [0; 4]).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        },
+    );
+}

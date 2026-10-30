@@ -96,6 +96,7 @@ impl Drop for File<'_> {
 fn map_error(e: Error) -> io::Error {
     match e {
         Error::Io(_, io_error) => io_error,
+        Error::Timeout(_) => io::ErrorKind::TimedOut.into(),
         Error::Ads(_, _, 0x704) => io::ErrorKind::InvalidInput.into(),
         Error::Ads(_, _, 0x70C) => io::ErrorKind::NotFound.into(),
         _ => io::Error::new(io::ErrorKind::Other, e.to_string()),
